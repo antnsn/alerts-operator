@@ -1087,14 +1087,15 @@ git commit -m "feat(api): ContactPoint with Alertmanager-native receivers and se
 **Interfaces:**
 - Produces:
 ```go
-type Route struct { Receiver string; GroupBy []string; GroupWait, GroupInterval, RepeatInterval string; Matchers []string; Continue bool; Routes []Route }
+type Route struct { Receiver string; GroupBy []string; GroupWait, GroupInterval, RepeatInterval string; Matchers []string; Continue bool; Routes []apiextensionsv1.JSON }
 type InhibitRule struct { SourceMatchers, TargetMatchers, Equal []string }
 type NotificationPolicySpec struct { TenantRef string; Route Route; InhibitRules []InhibitRule }
 type NotificationPolicyStatus struct { ObservedGeneration int64; Conditions []metav1.Condition }
-func (r *Route) Receivers() []string   // unique receiver names in the tree, depth-first
+func (r *Route) ChildRoutes() ([]Route, error)  // decodes Routes; wraps the first decode error as "routes[i]: <err>"
+func (r *Route) Receivers() ([]string, error)   // unique receiver names in the tree, depth-first; stops and returns the first decode error
 ```
 
-Note: `Route.Routes []Route` is recursive. controller-gen cannot generate an OpenAPI schema for a recursive type, so `Routes` must carry `// +kubebuilder:validation:Schemaless` and `// +kubebuilder:pruning:PreserveUnknownFields`, and the depth is validated at reconcile time (Task 15).
+Note: `Route.Routes` is recursive in shape, but a recursive Go type cannot get an OpenAPI schema from controller-gen. Instead of `[]Route`, `Routes` is `[]apiextensionsv1.JSON` — raw JSON blobs with the same shape as `Route` — carrying `// +kubebuilder:validation:Schemaless` and `// +kubebuilder:pruning:PreserveUnknownFields`. Child routes are decoded with `ChildRoutes()` and the depth is validated at reconcile time (Task 17).
 
 - [ ] **Step 1: Failing tests**
 
@@ -1105,8 +1106,10 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -1120,7 +1123,7 @@ func TestNotificationPolicyCEL(t *testing.T) {
 		t.Fatalf("expected error for missing route.receiver")
 	}
 	obj.Spec.Route.Receiver = "keep"
-	obj.Spec.Route.Routes = []observabilityv1alpha1.Route{{Receiver: "po", Matchers: []string{`severity="critical"`}}}
+	obj.Spec.Route.Routes = []apiextensionsv1.JSON{{Raw: []byte(`{"receiver":"po","matchers":["severity=\"critical\""]}`)}}
 	if err := testClient.Create(testCtx, obj); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -1128,16 +1131,32 @@ func TestNotificationPolicyCEL(t *testing.T) {
 	if err := testClient.Get(testCtx, client.ObjectKeyFromObject(obj), got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Spec.Route.Routes) != 1 || got.Spec.Route.Routes[0].Receiver != "po" {
+	children, err := got.Spec.Route.ChildRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Receiver != "po" {
 		t.Fatalf("nested routes not round-tripped: %+v", got.Spec.Route)
 	}
 	_ = testClient.Delete(testCtx, obj)
 }
 
 func TestRouteReceivers(t *testing.T) {
-	r := observabilityv1alpha1.Route{Receiver: "a", Routes: []observabilityv1alpha1.Route{{Receiver: "b", Routes: []observabilityv1alpha1.Route{{Receiver: "a"}}}, {Receiver: "c"}}}
-	if got := r.Receivers(); !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+	r := observabilityv1alpha1.Route{Receiver: "a", Routes: []apiextensionsv1.JSON{
+		{Raw: []byte(`{"receiver":"b","routes":[{"receiver":"a"}]}`)},
+		{Raw: []byte(`{"receiver":"c"}`)},
+	}}
+	got, err := r.Receivers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
 		t.Fatalf("got %v", got)
+	}
+
+	bad := observabilityv1alpha1.Route{Receiver: "a", Routes: []apiextensionsv1.JSON{{Raw: []byte("42")}}}
+	if _, err := bad.Receivers(); err == nil || !strings.Contains(err.Error(), "routes[0]") {
+		t.Fatalf("expected decode error mentioning routes[0], got %v", err)
 	}
 }
 ```
@@ -1153,7 +1172,13 @@ Expected: FAIL.
 ```go
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	"encoding/json"
+	"fmt"
+
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // Route is an Alertmanager routing tree node. Receiver names refer to ContactPoints in the policy's namespace.
 type Route struct {
@@ -1172,29 +1197,52 @@ type Route struct {
 	Matchers []string `json:"matchers,omitempty"`
 	// +optional
 	Continue bool `json:"continue,omitempty"`
-	// Routes are child routes. Schemaless because the type is recursive; validated at reconcile time.
+	// Routes are child routes with the same shape as Route; stored as raw JSON because the type is
+	// recursive. Decoded and validated at reconcile time.
 	// +kubebuilder:validation:Schemaless
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +optional
-	Routes []Route `json:"routes,omitempty"`
+	Routes []apiextensionsv1.JSON `json:"routes,omitempty"`
+}
+
+// ChildRoutes decodes Routes into typed Route values, in order. It returns the first decode
+// error, wrapped with the index of the offending entry.
+func (r *Route) ChildRoutes() ([]Route, error) {
+	out := make([]Route, len(r.Routes))
+	for i, raw := range r.Routes {
+		if err := json.Unmarshal(raw.Raw, &out[i]); err != nil {
+			return nil, fmt.Errorf("routes[%d]: %w", i, err)
+		}
+	}
+	return out, nil
 }
 
 // Receivers returns the unique receiver names in the tree, depth-first, in first-seen order.
-func (r *Route) Receivers() []string {
+// It stops and returns the first decode error encountered while walking child routes.
+func (r *Route) Receivers() ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
-	var walk func(*Route)
-	walk = func(n *Route) {
+	var walk func(*Route) error
+	walk = func(n *Route) error {
 		if !seen[n.Receiver] {
 			seen[n.Receiver] = true
 			out = append(out, n.Receiver)
 		}
-		for i := range n.Routes {
-			walk(&n.Routes[i])
+		children, err := n.ChildRoutes()
+		if err != nil {
+			return err
 		}
+		for i := range children {
+			if err := walk(&children[i]); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	walk(r)
-	return out
+	if err := walk(r); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 type InhibitRule struct {
@@ -1247,10 +1295,12 @@ func init() {
 }
 ```
 
+Run `go get k8s.io/apiextensions-apiserver@v0.37.0` (same minor as `k8s.io/api`) to pull in the `apiextensionsv1.JSON` type.
+
 - [ ] **Step 4: Regenerate and test**
 
 Run: `make manifests generate && make test`
-Expected: PASS. If controller-gen errors on the recursive type even with Schemaless, change `Routes` to `[]Route` → keep type but add `// +kubebuilder:validation:Type=array` and `// +kubebuilder:validation:XPreserveUnknownFields`, then re-run.
+Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -2517,6 +2567,7 @@ import (
 	"strings"
 	"testing"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
@@ -2540,7 +2591,7 @@ func fullInput() AlertmanagerInput {
 		Policy: &v1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "homelab", Namespace: "monitoring"}, Spec: v1alpha1.NotificationPolicySpec{
 			TenantRef: "t",
 			Route: v1alpha1.Route{Receiver: "keep", GroupBy: []string{"alertname", "namespace"}, GroupWait: "30s", GroupInterval: "5m", RepeatInterval: "4h",
-				Routes: []v1alpha1.Route{{Receiver: "pushover", Matchers: []string{`severity="critical"`}, Continue: true}}},
+				Routes: []apiextensionsv1.JSON{{Raw: []byte(`{"receiver":"pushover","matchers":["severity=\"critical\""],"continue":true}`)}}},
 			InhibitRules: []v1alpha1.InhibitRule{{SourceMatchers: []string{`severity="critical"`}, TargetMatchers: []string{`severity="warning"`}, Equal: []string{"alertname"}}},
 		}},
 		ContactPoints: []v1alpha1.ContactPoint{
@@ -2591,7 +2642,7 @@ func TestAlertmanagerAttributesErrors(t *testing.T) {
 	}
 
 	in = fullInput()
-	in.Policy.Spec.Route.Routes[0].Receiver = "nope"
+	in.Policy.Spec.Route.Routes[0] = apiextensionsv1.JSON{Raw: []byte(`{"receiver":"nope"}`)}
 	_, err = Alertmanager(in)
 	if !errors.As(err, &ae) || ae.Kind != "NotificationPolicy" || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("expected policy attribution, got %v", err)
@@ -2602,6 +2653,13 @@ func TestAlertmanagerAttributesErrors(t *testing.T) {
 	_, err = Alertmanager(in)
 	if !errors.As(err, &ae) || ae.Kind != "NotificationPolicy" {
 		t.Fatalf("expected validation attributed to policy, got %v", err)
+	}
+
+	in = fullInput()
+	in.Policy.Spec.Route.Routes[0] = apiextensionsv1.JSON{Raw: []byte("[]")}
+	_, err = Alertmanager(in)
+	if !errors.As(err, &ae) || ae.Kind != "NotificationPolicy" {
+		t.Fatalf("expected decode-error attribution, got %v", err)
 	}
 }
 
@@ -2827,8 +2885,12 @@ func compileRoute(r *v1alpha1.Route, ns string, known map[string]bool) (*amRoute
 	}
 	out := &amRoute{Receiver: full, GroupBy: r.GroupBy, GroupWait: r.GroupWait, GroupInterval: r.GroupInterval,
 		RepeatInterval: r.RepeatInterval, Matchers: r.Matchers, Continue: r.Continue}
-	for i := range r.Routes {
-		child, err := compileRoute(&r.Routes[i], ns, known)
+	children, err := r.ChildRoutes()
+	if err != nil {
+		return nil, fmt.Errorf("route %q: %w", r.Receiver, err)
+	}
+	for i := range children {
+		child, err := compileRoute(&children[i], ns, known)
 		if err != nil {
 			return nil, err
 		}
@@ -4055,16 +4117,16 @@ git commit -m "feat(controller): ContactPoint validation with secret watch"
 - Test: `internal/controller/notificationpolicy_controller_test.go`
 
 **Interfaces:**
-- Consumes: `Route.Receivers()` (Task 6), `index.IndexTenantRef` (Task 13), helpers (Tasks 14–16).
+- Consumes: `Route.Receivers()` and `Route.ChildRoutes()` (Task 6), `index.IndexTenantRef` (Task 13), helpers (Tasks 14–16).
 - Produces:
 ```go
 const maxRouteDepth = 10
 type NotificationPolicyReconciler struct { client.Client; Scheme *runtime.Scheme }
-func routeDepth(r *v1alpha1.Route) int                                              // root = 1
+func routeDepth(r *v1alpha1.Route) (int, error)                                     // root = 1; propagates ChildRoutes() decode errors
 func policyWinner(items []v1alpha1.NotificationPolicy) *v1alpha1.NotificationPolicy // oldest creationTimestamp, tie → lexicographically smallest "<ns>/<name>"; nil for empty
 func (r *NotificationPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error
 ```
-`policyWinner` is exported-in-package so the Tenant reconciler (Task 18) uses the same rule.
+`policyWinner` is exported-in-package so the Tenant reconciler (Task 18) uses the same rule. A `Route.Receivers()` or `routeDepth()` decode error (malformed JSON under `spec.route.routes`) sets `Accepted=False reason=Invalid` with the error message.
 
 - [ ] **Step 1: Failing tests**
 
@@ -4078,14 +4140,19 @@ import (
 	"testing"
 	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 )
 
 func TestRouteDepthAndWinner(t *testing.T) {
-	r := observabilityv1alpha1.Route{Receiver: "a", Routes: []observabilityv1alpha1.Route{{Receiver: "b", Routes: []observabilityv1alpha1.Route{{Receiver: "c"}}}}}
-	if d := routeDepth(&r); d != 3 {
+	r := observabilityv1alpha1.Route{Receiver: "a", Routes: []apiextensionsv1.JSON{{Raw: []byte(`{"receiver":"b","routes":[{"receiver":"c"}]}`)}}}
+	d, err := routeDepth(&r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 3 {
 		t.Fatalf("depth %d", d)
 	}
 	now := metav1.Now()
@@ -4111,7 +4178,7 @@ func TestNotificationPolicyAccepted(t *testing.T) {
 
 	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np-a", Namespace: "default"},
 		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: "np-tenant", Route: observabilityv1alpha1.Route{Receiver: "np-keep",
-			Routes: []observabilityv1alpha1.Route{{Receiver: "np-later"}}}}}
+			Routes: []apiextensionsv1.JSON{{Raw: []byte(`{"receiver":"np-later"}`)}}}}}
 	createAndCleanup(t, pol)
 	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonContactPointNotFound)
 	if !strings.Contains(findCond(pol, observabilityv1alpha1.ConditionAccepted).Message, "np-later") {
@@ -4153,6 +4220,20 @@ func TestNotificationPolicyAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitCondition(t, second, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+}
+
+func TestNotificationPolicyInvalidRouteJSON(t *testing.T) {
+	newFakeTenant(t, "np-tenant-3", true, false)
+	keep := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "np-keep3", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: "np-tenant-3", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://keep3"}}}}
+	createAndCleanup(t, keep)
+
+	// A malformed child route (routes: [42]) fails ChildRoutes() decoding at reconcile time.
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np-badjson", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: "np-tenant-3", Route: observabilityv1alpha1.Route{Receiver: "np-keep3",
+			Routes: []apiextensionsv1.JSON{{Raw: []byte("42")}}}}}
+	createAndCleanup(t, pol)
+	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalid)
 }
 ```
 
@@ -4225,10 +4306,18 @@ func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alph
 	} else if err != nil {
 		return "", "", "", err
 	}
-	if d := routeDepth(&pol.Spec.Route); d > maxRouteDepth {
-		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, fmt.Sprintf("route tree depth %d exceeds %d", d, maxRouteDepth), nil
+	depth, err := routeDepth(&pol.Spec.Route)
+	if err != nil {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), nil
 	}
-	for _, name := range pol.Spec.Route.Receivers() {
+	if depth > maxRouteDepth {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, fmt.Sprintf("route tree depth %d exceeds %d", depth, maxRouteDepth), nil
+	}
+	receivers, err := pol.Spec.Route.Receivers()
+	if err != nil {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), nil
+	}
+	for _, name := range receivers {
 		var cp v1alpha1.ContactPoint
 		err := r.Get(ctx, types.NamespacedName{Namespace: pol.Namespace, Name: name}, &cp)
 		if errors.IsNotFound(err) || (err == nil && cp.Spec.TenantRef != pol.Spec.TenantRef) {
@@ -4250,15 +4339,24 @@ func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alph
 	return metav1.ConditionTrue, v1alpha1.ReasonAccepted, "", nil
 }
 
-// routeDepth returns the depth of the route tree; a single root is 1.
-func routeDepth(r *v1alpha1.Route) int {
+// routeDepth returns the depth of the route tree; a single root is 1. It decodes children via
+// ChildRoutes() and returns the first decode error, which the caller treats as Invalid.
+func routeDepth(r *v1alpha1.Route) (int, error) {
+	children, err := r.ChildRoutes()
+	if err != nil {
+		return 0, err
+	}
 	max := 0
-	for i := range r.Routes {
-		if d := routeDepth(&r.Routes[i]); d > max {
+	for i := range children {
+		d, err := routeDepth(&children[i])
+		if err != nil {
+			return 0, err
+		}
+		if d > max {
 			max = d
 		}
 	}
-	return max + 1
+	return max + 1, nil
 }
 
 // policyWinner picks the one policy that counts for a tenant: oldest first, then "<ns>/<name>".
