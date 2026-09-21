@@ -100,7 +100,7 @@ type AlertRuleGroupStatus struct {
 type AlertRuleGroup struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              AlertRuleGroupSpec   `json:"spec,omitempty"`
+	Spec              AlertRuleGroupSpec   `json:"spec"`
 	Status            AlertRuleGroupStatus `json:"status,omitempty"`
 }
 
