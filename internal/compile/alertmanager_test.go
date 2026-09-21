@@ -116,23 +116,37 @@ func TestAlertmanagerAttributesErrors(t *testing.T) {
 
 func TestAlertmanagerRedactsSecretsFromErrors(t *testing.T) {
 	in := fullInput()
-	// A trailing control character makes Go's url.Parse itself fail with an error that embeds
-	// the full raw string it was given -- this is the leak vector: Alertmanager's config loader
-	// surfaces url.Parse errors verbatim, and secret values must never reach that text.
+	// Every resolved value here is realistic-length and non-colliding, so the assertions below
+	// test genuine redaction rather than an accidental short-value substring collision (fullInput's
+	// default secrets are single characters like "U"/"T"/"K", which is fine for the golden test but
+	// would make this test pass for the wrong reason: e.g. "T" happens to be a substring of
+	// "SECRET-VALUE").
 	in.Secrets = secrets(map[string]string{
-		"monitoring/po/user": "U", "monitoring/po/token": "T", "monitoring/keep/api-key": "K",
-		"monitoring/slack/url": "https://hooks.slack.com/services/SECRET-VALUE\n", "monitoring/discord/url": "https://discord.com/api/webhooks/x",
-		"monitoring/tg/token": "TG", "monitoring/smtp/pw": "PW", "team-b/hook/url": "http://hook",
+		"monitoring/po/user": "pushover-user-abc123", "monitoring/po/token": "pushover-token-xyz789", "monitoring/keep/api-key": "keep-api-key-456",
+		// A trailing control character makes Go's url.Parse itself fail with an error whose
+		// Error() method formats the URL with %q (Go double-quote escaping): a secret ending in an
+		// actual newline byte appears in the error text as a literal `\n` (backslash + n), not a
+		// raw newline byte. That's the leak vector -- Alertmanager's config loader surfaces
+		// url.Parse errors verbatim -- so both the raw value and its %q-escaped form must be
+		// redacted.
+		"monitoring/slack/url": "https://hooks.slack.com/services/SECRET-VALUE\n", "monitoring/discord/url": "https://discord.com/api/webhooks/discord-secret-abc",
+		"monitoring/tg/token": "telegram-token-def456", "monitoring/smtp/pw": "smtp-password-ghi789", "team-b/hook/url": "http://hook",
 	})
 	_, err := Alertmanager(in)
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if strings.Contains(err.Error(), "SECRET-VALUE") {
-		t.Fatalf("secret value leaked into error: %v", err)
+		t.Fatalf("secret value leaked into error (raw or escaped): %v", err)
 	}
 	if !strings.Contains(err.Error(), "[REDACTED]") {
 		t.Fatalf("expected [REDACTED] marker, got %v", err)
+	}
+	// Unrelated error text must survive intact: redaction must not corrupt words that happen to
+	// share a short substring with some other resolved secret (a regression this test previously
+	// masked, found while investigating the escaped-form leak).
+	if !strings.Contains(err.Error(), "invalid control character") {
+		t.Fatalf("unrelated error text corrupted by redaction: %v", err)
 	}
 }
 

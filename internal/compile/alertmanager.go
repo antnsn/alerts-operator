@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/yaml"
@@ -53,18 +54,42 @@ func (r *secretRecorder) resolve(namespace, name, key string) (string, error) {
 	return v, err
 }
 
-// redact replaces every recorded secret value in msg with "[REDACTED]". Longest values are
-// replaced first so a value that is a substring of another isn't left partially redacted.
+// redact replaces every recorded secret value in msg with "[REDACTED]", in both its raw form and
+// its Go %q/strconv.Quote-escaped form (net/url.Error, among others, formats the value it was
+// given with %q, so a secret containing e.g. a literal newline shows up as a literal `\n` rather
+// than a raw newline byte -- the raw-only replacement missed that entirely).
+//
+// All replacements happen in a single pass over the original message via strings.Replacer, which
+// never rescans its own output: this matters because a short secret value can be a substring of
+// the literal word "REDACTED" itself (this bit us during testing -- doing the replacements
+// sequentially with strings.ReplaceAll turned an already-inserted "[REDACTED]" into
+// "[REDAC[REDACTED]ED]" when another, shorter, secret happened to match inside it). Values are
+// ordered longest-first so a value that's a substring of another isn't left partially redacted.
 func (r *secretRecorder) redact(msg string) string {
+	if len(r.values) == 0 {
+		return msg
+	}
 	vals := make([]string, 0, len(r.values))
 	for v := range r.values {
 		vals = append(vals, v)
 	}
 	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+
+	pairs := make([]string, 0, len(vals)*4)
 	for _, v := range vals {
-		msg = strings.ReplaceAll(msg, v, "[REDACTED]")
+		pairs = append(pairs, v, "[REDACTED]")
+		if esc := quotedInner(v); esc != v {
+			pairs = append(pairs, esc, "[REDACTED]")
+		}
 	}
-	return msg
+	return strings.NewReplacer(pairs...).Replace(msg)
+}
+
+// quotedInner returns s as it would appear inside a Go %q/strconv.Quote string, without the
+// surrounding quotes -- the escaping net/url.Error (and similar) applies to field values it embeds.
+func quotedInner(s string) string {
+	q := strconv.Quote(s)
+	return q[1 : len(q)-1]
 }
 
 // attribute wraps a non-nil err as an *AttributedError with its message redacted of any secret
