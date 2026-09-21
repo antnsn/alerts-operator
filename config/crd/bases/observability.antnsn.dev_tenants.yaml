@@ -232,7 +232,12 @@ spec:
                 - mimir
                 type: object
             type: object
+        required:
+        - spec
         type: object
+        x-kubernetes-validations:
+        - message: spec.resyncInterval must be a valid Go duration (e.g. '5m', '1h30m')
+          rule: '!has(self.spec.resyncInterval) || self.spec.resyncInterval.matches(''^[0-9]+(ns|us|ms|s|m|h)([0-9]+(ns|us|ms|s|m|h))*$'')'
     served: true
     storage: true
     subresources:

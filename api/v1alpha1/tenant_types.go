@@ -102,11 +102,12 @@ type TenantStatus struct {
 // +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantId`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.resyncInterval) || self.spec.resyncInterval.matches('^[0-9]+(ns|us|ms|s|m|h)([0-9]+(ns|us|ms|s|m|h))*$')",message="spec.resyncInterval must be a valid Go duration (e.g. '5m', '1h30m')"
 type Tenant struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   TenantSpec   `json:"spec,omitempty"`
+	Spec   TenantSpec   `json:"spec"`
 	Status TenantStatus `json:"status,omitempty"`
 }
 
