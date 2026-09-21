@@ -17,75 +17,120 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+const (
+	// DefaultRulesNamespacePrefix is the default namespace prefix for rule scoping.
+	DefaultRulesNamespacePrefix = "alerts-operator"
+	// DefaultResyncInterval is the default drift-repair period.
+	DefaultResyncInterval = 5 * time.Minute
+)
 
-// TenantSpec defines the desired state of Tenant
-type TenantSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of Tenant. Edit tenant_types.go to remove/update
+// BackendSpec describes how to reach one Mimir or Loki instance.
+type BackendSpec struct {
+	// Address is the base URL of the backend gateway, e.g. http://mimir-distributed-nginx.mimir:80
+	// +kubebuilder:validation:Pattern=`^https?://`
+	Address string `json:"address"`
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Auth *BackendAuth `json:"auth,omitempty"`
+}
+
+// BackendAuth describes authentication credentials for a backend.
+type BackendAuth struct {
+	// BasicAuthSecretRef points at a Secret with keys `username` and `password`.
+	// +optional
+	BasicAuthSecretRef *NamespacedName `json:"basicAuthSecretRef,omitempty"`
+}
+
+// AlertmanagerSpec describes how to reach an Alertmanager instance.
+type AlertmanagerSpec struct {
+	// TemplatesRef points at a ConfigMap whose entries become Alertmanager template_files.
+	// +optional
+	TemplatesRef *NamespacedName `json:"templatesRef,omitempty"`
+}
+
+// TenantSpec defines the desired state of Tenant.
+// +kubebuilder:validation:XValidation:rule="has(self.mimir) || has(self.loki)",message="at least one of spec.mimir or spec.loki must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.alertmanager) || has(self.mimir)",message="spec.alertmanager requires spec.mimir"
+type TenantSpec struct {
+	// TenantID is sent as X-Scope-OrgID on every backend request.
+	// +kubebuilder:validation:MinLength=1
+	TenantID string `json:"tenantId"`
+	// +optional
+	Mimir *BackendSpec `json:"mimir,omitempty"`
+	// +optional
+	Loki *BackendSpec `json:"loki,omitempty"`
+	// +optional
+	Alertmanager *AlertmanagerSpec `json:"alertmanager,omitempty"`
+	// RulesNamespacePrefix scopes which backend rule namespaces this operator owns. Default "alerts-operator".
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.-]+$`
+	// +optional
+	RulesNamespacePrefix string `json:"rulesNamespacePrefix,omitempty"`
+	// ResyncInterval is the drift-repair period. Default 5m.
+	// +optional
+	ResyncInterval *metav1.Duration `json:"resyncInterval,omitempty"`
+}
+
+// RuleGroupCounts tracks the number of rule groups per backend.
+type RuleGroupCounts struct {
+	Mimir int32 `json:"mimir"`
+	Loki  int32 `json:"loki"`
 }
 
 // TenantStatus defines the observed state of Tenant.
 type TenantStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the Tenant resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// +optional
 	// +listType=map
 	// +listMapKey=type
-	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +optional
+	AlertmanagerConfigHash string `json:"alertmanagerConfigHash,omitempty"`
+	// +optional
+	RuleGroups RuleGroupCounts `json:"ruleGroups,omitempty"`
 }
 
+// Tenant is the Schema for the tenants API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-
-// Tenant is the Schema for the tenants API
+// +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantId`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type Tenant struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// metadata is a standard object metadata
-	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of Tenant
-	// +required
-	Spec TenantSpec `json:"spec"`
-
-	// status defines the observed state of Tenant
-	// +optional
-	Status TenantStatus `json:"status,omitzero"`
+	Spec   TenantSpec   `json:"spec,omitempty"`
+	Status TenantStatus `json:"status,omitempty"`
 }
 
-// +kubebuilder:object:root=true
+// Prefix returns the effective rules namespace prefix, using the default if not specified.
+func (t *Tenant) Prefix() string {
+	if t.Spec.RulesNamespacePrefix == "" {
+		return DefaultRulesNamespacePrefix
+	}
+	return t.Spec.RulesNamespacePrefix
+}
 
-// TenantList contains a list of Tenant
+// Resync returns the effective resync interval, using the default if not specified.
+func (t *Tenant) Resync() time.Duration {
+	if t.Spec.ResyncInterval == nil || t.Spec.ResyncInterval.Duration <= 0 {
+		return DefaultResyncInterval
+	}
+	return t.Spec.ResyncInterval.Duration
+}
+
+// TenantList contains a list of Tenant.
+// +kubebuilder:object:root=true
 type TenantList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Tenant `json:"items"`
 }
 

@@ -14,10 +14,20 @@ spec:
     singular: tenant
   scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantId
+      name: Tenant
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Tenant is the Schema for the tenants API
+        description: Tenant is the Schema for the tenants API.
         properties:
           apiVersion:
             description: |-
@@ -37,27 +47,115 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of Tenant
+            description: TenantSpec defines the desired state of Tenant.
             properties:
-              foo:
-                description: foo is an example field of Tenant. Edit tenant_types.go
-                  to remove/update
+              alertmanager:
+                description: AlertmanagerSpec describes how to reach an Alertmanager
+                  instance.
+                properties:
+                  templatesRef:
+                    description: TemplatesRef points at a ConfigMap whose entries
+                      become Alertmanager template_files.
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                type: object
+              loki:
+                description: BackendSpec describes how to reach one Mimir or Loki
+                  instance.
+                properties:
+                  address:
+                    description: Address is the base URL of the backend gateway, e.g.
+                      http://mimir-distributed-nginx.mimir:80
+                    pattern: ^https?://
+                    type: string
+                  auth:
+                    description: BackendAuth describes authentication credentials
+                      for a backend.
+                    properties:
+                      basicAuthSecretRef:
+                        description: BasicAuthSecretRef points at a Secret with keys
+                          `username` and `password`.
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          namespace:
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    type: object
+                required:
+                - address
+                type: object
+              mimir:
+                description: BackendSpec describes how to reach one Mimir or Loki
+                  instance.
+                properties:
+                  address:
+                    description: Address is the base URL of the backend gateway, e.g.
+                      http://mimir-distributed-nginx.mimir:80
+                    pattern: ^https?://
+                    type: string
+                  auth:
+                    description: BackendAuth describes authentication credentials
+                      for a backend.
+                    properties:
+                      basicAuthSecretRef:
+                        description: BasicAuthSecretRef points at a Secret with keys
+                          `username` and `password`.
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          namespace:
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    type: object
+                required:
+                - address
+                type: object
+              resyncInterval:
+                description: ResyncInterval is the drift-repair period. Default 5m.
                 type: string
+              rulesNamespacePrefix:
+                description: RulesNamespacePrefix scopes which backend rule namespaces
+                  this operator owns. Default "alerts-operator".
+                pattern: ^[A-Za-z0-9_.-]+$
+                type: string
+              tenantId:
+                description: TenantID is sent as X-Scope-OrgID on every backend request.
+                minLength: 1
+                type: string
+            required:
+            - tenantId
             type: object
+            x-kubernetes-validations:
+            - message: at least one of spec.mimir or spec.loki must be set
+              rule: has(self.mimir) || has(self.loki)
+            - message: spec.alertmanager requires spec.mimir
+              rule: '!has(self.alertmanager) || has(self.mimir)'
           status:
-            description: status defines the observed state of Tenant
+            description: TenantStatus defines the observed state of Tenant.
             properties:
+              alertmanagerConfigHash:
+                type: string
               conditions:
-                description: |-
-                  conditions represent the current state of the Tenant resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,9 +214,24 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
+              ruleGroups:
+                description: RuleGroupCounts tracks the number of rule groups per
+                  backend.
+                properties:
+                  loki:
+                    format: int32
+                    type: integer
+                  mimir:
+                    format: int32
+                    type: integer
+                required:
+                - loki
+                - mimir
+                type: object
             type: object
-        required:
-        - spec
         type: object
     served: true
     storage: true
