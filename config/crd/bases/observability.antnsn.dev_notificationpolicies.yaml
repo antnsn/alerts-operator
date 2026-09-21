@@ -14,11 +14,21 @@ spec:
     singular: notificationpolicy
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantRef
+      name: Tenant
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Synced")].status
+      name: Synced
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: NotificationPolicy is the Schema for the notificationpolicies
-          API
+          API.
         properties:
           apiVersion:
             description: |-
@@ -38,27 +48,68 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of NotificationPolicy
+            description: NotificationPolicySpec defines the desired state of NotificationPolicy.
             properties:
-              foo:
-                description: foo is an example field of NotificationPolicy. Edit notificationpolicy_types.go
-                  to remove/update
+              inhibitRules:
+                items:
+                  description: InhibitRule mirrors an Alertmanager inhibition rule.
+                  properties:
+                    equal:
+                      items:
+                        type: string
+                      type: array
+                    sourceMatchers:
+                      items:
+                        type: string
+                      type: array
+                    targetMatchers:
+                      items:
+                        type: string
+                      type: array
+                  type: object
+                type: array
+              route:
+                description: Route is an Alertmanager routing tree node. Receiver
+                  names refer to ContactPoints in the policy's namespace.
+                properties:
+                  continue:
+                    type: boolean
+                  groupBy:
+                    items:
+                      type: string
+                    type: array
+                  groupInterval:
+                    type: string
+                  groupWait:
+                    type: string
+                  matchers:
+                    description: Matchers use Alertmanager matcher syntax, e.g. `severity="critical"`.
+                    items:
+                      type: string
+                    type: array
+                  receiver:
+                    minLength: 1
+                    type: string
+                  repeatInterval:
+                    type: string
+                  routes:
+                    description: Routes are child routes. Schemaless because the type
+                      is recursive; validated at reconcile time.
+                    x-kubernetes-preserve-unknown-fields: true
+                required:
+                - receiver
+                type: object
+              tenantRef:
+                minLength: 1
                 type: string
+            required:
+            - route
+            - tenantRef
             type: object
           status:
-            description: status defines the observed state of NotificationPolicy
+            description: NotificationPolicyStatus defines the observed state of NotificationPolicy.
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the NotificationPolicy resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -117,6 +168,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
             type: object
         required:
         - spec

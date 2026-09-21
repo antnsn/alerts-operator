@@ -21,70 +21,95 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
-// NotificationPolicySpec defines the desired state of NotificationPolicy
-type NotificationPolicySpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of NotificationPolicy. Edit notificationpolicy_types.go to remove/update
+// Route is an Alertmanager routing tree node. Receiver names refer to ContactPoints in the policy's namespace.
+type Route struct {
+	// +kubebuilder:validation:MinLength=1
+	Receiver string `json:"receiver"`
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	GroupBy []string `json:"groupBy,omitempty"`
+	// +optional
+	GroupWait string `json:"groupWait,omitempty"`
+	// +optional
+	GroupInterval string `json:"groupInterval,omitempty"`
+	// +optional
+	RepeatInterval string `json:"repeatInterval,omitempty"`
+	// Matchers use Alertmanager matcher syntax, e.g. `severity="critical"`.
+	// +optional
+	Matchers []string `json:"matchers,omitempty"`
+	// +optional
+	Continue bool `json:"continue,omitempty"`
+	// Routes are child routes. Schemaless because the type is recursive; validated at reconcile time.
+	// +kubebuilder:validation:Schemaless
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	Routes []Route `json:"routes,omitempty"`
+}
+
+// Receivers returns the unique receiver names in the tree, depth-first, in first-seen order.
+func (r *Route) Receivers() []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(*Route)
+	walk = func(n *Route) {
+		if !seen[n.Receiver] {
+			seen[n.Receiver] = true
+			out = append(out, n.Receiver)
+		}
+		for i := range n.Routes {
+			walk(&n.Routes[i])
+		}
+	}
+	walk(r)
+	return out
+}
+
+// InhibitRule mirrors an Alertmanager inhibition rule.
+type InhibitRule struct {
+	// +optional
+	SourceMatchers []string `json:"sourceMatchers,omitempty"`
+	// +optional
+	TargetMatchers []string `json:"targetMatchers,omitempty"`
+	// +optional
+	Equal []string `json:"equal,omitempty"`
+}
+
+// NotificationPolicySpec defines the desired state of NotificationPolicy.
+type NotificationPolicySpec struct {
+	// +kubebuilder:validation:MinLength=1
+	TenantRef string `json:"tenantRef"`
+	Route     Route  `json:"route"`
+	// +optional
+	InhibitRules []InhibitRule `json:"inhibitRules,omitempty"`
 }
 
 // NotificationPolicyStatus defines the observed state of NotificationPolicy.
 type NotificationPolicyStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the NotificationPolicy resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// +optional
 	// +listType=map
 	// +listMapKey=type
-	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// NotificationPolicy is the Schema for the notificationpolicies API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-
-// NotificationPolicy is the Schema for the notificationpolicies API
+// +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantRef`
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`
+// +kubebuilder:printcolumn:name="Synced",type=string,JSONPath=`.status.conditions[?(@.type=="Synced")].status`
 type NotificationPolicy struct {
-	metav1.TypeMeta `json:",inline"`
-
-	// metadata is a standard object metadata
-	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of NotificationPolicy
-	// +required
-	Spec NotificationPolicySpec `json:"spec"`
-
-	// status defines the observed state of NotificationPolicy
-	// +optional
-	Status NotificationPolicyStatus `json:"status,omitzero"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              NotificationPolicySpec   `json:"spec"`
+	Status            NotificationPolicyStatus `json:"status,omitempty"`
 }
 
+// NotificationPolicyList contains a list of NotificationPolicy.
 // +kubebuilder:object:root=true
-
-// NotificationPolicyList contains a list of NotificationPolicy
 type NotificationPolicyList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []NotificationPolicy `json:"items"`
 }
 
