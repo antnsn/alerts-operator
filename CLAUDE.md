@@ -6,12 +6,13 @@ Long-form project memory: `~/Documents/obsidian/Private/projects/Alerts Operator
 
 ## Workflow rules
 
-- **All development tasks run in subagents.** Use `superpowers:subagent-driven-development`
-  when executing plans; dispatch implementation, test-writing and review work to subagents.
-  The main session coordinates, reviews results, and keeps context small.
-- **`/codex:review` on every code change.** Not only before push: after each completed
-  task/edit set, run `codex:review` against the working tree or staged diff and act on findings
-  before moving to the next task.
+- **All work runs in subagents** — code, tests, docs, plans, chart. Use
+  `superpowers:subagent-driven-development` when executing plans; use `Agent` (fork) for any
+  other multi-step task. The main session only briefs, coordinates, reviews results, and
+  keeps context small. Writing files directly from the main session is a violation.
+- **`/codex:review` on every change, code or docs.** Not only before push: after each completed
+  task/edit set (including spec, plan, README, chart, workflow edits), run `codex:review` against
+  the working tree or staged diff and act on findings before moving to the next task.
 - TDD (`superpowers:test-driven-development`) for all implementation.
 - Beads (`bd`) for task tracking. `bd prime` at session start.
 - No `--no-verify`, no force-push to `main`, no amending published commits.
