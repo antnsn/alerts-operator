@@ -134,7 +134,9 @@ func (h *HTTP) GetYAML(ctx context.Context, path string, out any) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	// Always unmarshal to properly clear the output parameter, even for empty bodies
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true, nil
+	}
 	if err := yaml.Unmarshal(body, out); err != nil {
 		return true, fmt.Errorf("decode %s: %w", path, err)
 	}

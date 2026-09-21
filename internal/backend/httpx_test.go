@@ -79,6 +79,31 @@ func TestHTTPErrorClassification(t *testing.T) {
 	}
 }
 
+func TestGetYAMLEmptyBodyDoesNotModifyOut(t *testing.T) {
+	// Verify documented contract: empty 2xx body returns found=true without modifying out
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		// Empty body
+	}))
+	defer srv.Close()
+
+	h := NewHTTP(Options{Address: srv.URL, TenantID: "1"})
+	ctx := context.Background()
+
+	// Initialize output with a value to verify it's not modified
+	out := map[string]string{"original": "value"}
+	found, err := h.GetYAML(ctx, "/", &out)
+
+	if !found || err != nil {
+		t.Fatalf("empty 2xx: found=%v err=%v", found, err)
+	}
+
+	// Verify the output parameter was NOT modified
+	if _, ok := out["original"]; !ok {
+		t.Fatalf("empty body modified out: %v", out)
+	}
+}
+
 func TestHTTPOversizedRejectedBody(t *testing.T) {
 	// Issue: if reading a >=400 response body fails/truncates (e.g., exceeds 8 MiB limit),
 	// should still return StatusError so IsRejected is true, not IsUnavailable
