@@ -93,8 +93,9 @@ spec:
                   repeatInterval:
                     type: string
                   routes:
-                    description: Routes are child routes. Schemaless because the type
-                      is recursive; validated at reconcile time.
+                    description: |-
+                      Routes are child routes with the same shape as Route; stored as raw JSON because the type is
+                      recursive. Decoded and validated at reconcile time.
                     x-kubernetes-preserve-unknown-fields: true
                 required:
                 - receiver

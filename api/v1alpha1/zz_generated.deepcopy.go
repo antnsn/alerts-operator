@@ -21,6 +21,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -605,7 +606,7 @@ func (in *Route) DeepCopyInto(out *Route) {
 	}
 	if in.Routes != nil {
 		in, out := &in.Routes, &out.Routes
-		*out = make([]Route, len(*in))
+		*out = make([]apiextensionsv1.JSON, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
