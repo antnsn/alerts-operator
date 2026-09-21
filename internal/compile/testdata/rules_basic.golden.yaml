@@ -1,0 +1,19 @@
+alerts-operator/loki/udm:
+- name: udm
+  rules:
+  - alert: UDMErrors
+    expr: sum(rate({host="udm"} |= "error" [5m])) > 1
+    keep_firing_for: 10m
+alerts-operator/monitoring/homelab:
+- interval: 1m
+  name: node.health
+  rules:
+  - alert: NodeDown
+    annotations:
+      summary: '{{ $labels.instance }} down'
+    expr: up{job="node"} == 0
+    for: 5m
+    labels:
+      severity: critical
+  - expr: avg by (job) (up)
+    record: job:up:ratio
