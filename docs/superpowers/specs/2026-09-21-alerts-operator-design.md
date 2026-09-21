@@ -164,7 +164,10 @@ validate and set `Accepted`, then enqueue their Tenant. Children have no finaliz
 2. List children with `tenantRef == name` via field index; use only `Accepted=True`.
 3. **Alertmanager** (if `spec.mimir` set):
    - No accepted NotificationPolicy → `AlertmanagerSynced=False reason=NoNotificationPolicy`; leave backend untouched.
-   - Else `compile.Alertmanager(policy, contactPoints, secretValues, templates)` → YAML
+   - Else `compile.Alertmanager(policy, contactPoints, secretValues, templates)` → YAML.
+     All accepted ContactPoints of the tenant (any namespace) become receivers, even if
+     the route tree does not reference them (Alertmanager allows unreferenced receivers;
+     they still get `Synced=True`).
      `{alertmanager_config: <string>, template_files: {…}}`. Validate the inner
      config with `github.com/prometheus/alertmanager/config`; on error attribute to
      the offending ContactPoint/Policy (`Synced=False reason=Invalid`).
