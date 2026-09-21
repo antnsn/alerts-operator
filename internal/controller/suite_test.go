@@ -50,16 +50,17 @@ func TestMain(m *testing.M) {
 	if err := setupReconcilers(mgr); err != nil {
 		panic(err)
 	}
-	go func() {
-		if err := mgr.Start(testCtx); err != nil {
-			panic(err)
-		}
-	}()
+	mgrDone := make(chan error, 1)
+	go func() { mgrDone <- mgr.Start(testCtx) }()
 	if !mgr.GetCache().WaitForCacheSync(testCtx) {
 		panic("cache sync failed")
 	}
 	code := m.Run()
 	testCancel()
+	// Let the manager and its reconcilers drain before the API server goes away.
+	if err := <-mgrDone; err != nil {
+		panic(err)
+	}
 	_ = testEnv.Stop()
 	os.Exit(code)
 }
