@@ -4340,7 +4340,7 @@ git commit -m "feat(controller): NotificationPolicy validation, receiver refs an
 - Test: `internal/controller/tenant_controller_test.go`
 
 **Interfaces:**
-- Consumes: `backend.Options`, `backend.RuleStore`, `backend.AlertmanagerStore`, `backend.BasicAuth` (Task 7); `mimir.New` (Task 9); `loki.New` (Task 10); `index.IndexTenantRef` (Task 13); `policyWinner` (Task 17); `setCondition`, `patchStatus`, `mapToTenant` (Task 14); `tenant.Prefix()`, `tenant.Resync()` (Task 3).
+- Consumes: `backend.Options`, `backend.RuleStore`, `backend.AlertmanagerStore`, `backend.BasicAuth` (Task 7); `mimir.New` (Task 9); `loki.New` (Task 10); `compile.BackendNamespace` (Task 11); `index.IndexTenantRef` (Task 13); `policyWinner` (Task 17); `setCondition`, `patchStatus`, `mapToTenant` (Task 14); `tenant.Prefix()`, `tenant.Resync()` (Task 3).
 - Produces:
 ```go
 const tenantFinalizer = "observability.antnsn.dev/tenant"
@@ -4354,16 +4354,29 @@ type TenantReconciler struct {
 	mu         sync.Mutex
 	lastAMSync map[string]time.Time                    // tenant name → last successful Alertmanager sync
 }
-type children struct { ContactPoints []v1alpha1.ContactPoint; Policy *v1alpha1.NotificationPolicy; MimirGroups, LokiGroups []v1alpha1.AlertRuleGroup }
-func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) (*children, error)  // Accepted=True for the current generation only; Policy = policyWinner among accepted
+type children struct {
+	ContactPoints  []v1alpha1.ContactPoint
+	Policy         *v1alpha1.NotificationPolicy
+	MimirGroups    []v1alpha1.AlertRuleGroup
+	LokiGroups     []v1alpha1.AlertRuleGroup
+	KeepNamespaces map[string]bool // backend namespaces of stale-generation AlertRuleGroups: not written, not pruned, this pass
+	PendingAM      bool            // an accepted-for-this-tenant ContactPoint or NotificationPolicy is stale-generation
+}
+// listChildren splits accepted-current children by kind/backend. A child (any of the three kinds)
+// whose Accepted condition is missing or stale (ObservedGeneration < Generation) is neither desired
+// nor excluded: its AlertRuleGroup namespace lands in KeepNamespaces and, for a ContactPoint or
+// NotificationPolicy, PendingAM is set. Accepted=False at the current generation is a validated
+// rejection and stays excluded/prunable, same as before.
+func (r *TenantReconciler) listChildren(ctx context.Context, tenant *v1alpha1.Tenant) (*children, error)
 func acceptedCurrent(obj v1alpha1.Conditioned) bool
+func staleGeneration(obj v1alpha1.Conditioned) bool  // Accepted condition missing, or ObservedGeneration < Generation
 func (r *TenantReconciler) backendOptions(ctx context.Context, tenant *v1alpha1.Tenant, spec *v1alpha1.BackendSpec) (backend.Options, error)
 func (r *TenantReconciler) mimirClient(ctx, tenant) (MimirClient, error)
 func (r *TenantReconciler) lokiClient(ctx, tenant) (backend.RuleStore, error)
 // Contract for the sync functions (bodies in Task 19; stubs here):
 //   they set the relevant tenant.Status condition in memory and return a non-nil error ONLY
 //   for backend.IsUnavailable errors (caller returns it to controller-runtime → backoff).
-func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup) (int32, error)
+func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, keepNamespaces map[string]bool) (int32, error)
 func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha1.Tenant, store backend.AlertmanagerStore, ch *children) error
 func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant) error  // body in Task 20
 ```
@@ -4425,7 +4438,7 @@ func TestTenantListChildrenFiltersAccepted(t *testing.T) {
 	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, "")
 
 	r := &TenantReconciler{Client: testClient}
-	ch, err := r.listChildren(testCtx, tn.Name)
+	ch, err := r.listChildren(testCtx, tn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4474,6 +4487,7 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend"
 	"github.com/antnsn/alerts-operator/internal/backend/loki"
 	"github.com/antnsn/alerts-operator/internal/backend/mimir"
+	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
 )
 
@@ -4497,12 +4511,17 @@ type TenantReconciler struct {
 	lastAMSync map[string]time.Time
 }
 
-// children are the Accepted CRs referencing one Tenant.
+// children are the Accepted CRs referencing one Tenant, plus what's known about children that are
+// accepted for a stale generation (see staleGeneration): their backend state must survive this pass
+// untouched rather than being treated as no-longer-desired and pruned.
 type children struct {
 	ContactPoints []v1alpha1.ContactPoint
 	Policy        *v1alpha1.NotificationPolicy
 	MimirGroups   []v1alpha1.AlertRuleGroup
 	LokiGroups    []v1alpha1.AlertRuleGroup
+
+	KeepNamespaces map[string]bool // backend namespaces of stale-generation AlertRuleGroups
+	PendingAM      bool            // a ContactPoint or NotificationPolicy referencing this tenant is stale-generation
 }
 
 // +kubebuilder:rbac:groups=observability.antnsn.dev,resources=tenants,verbs=get;list;watch;update;patch
@@ -4543,7 +4562,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// status patch is the diff against this snapshot.
 	base := tenant.DeepCopy()
 
-	ch, err := r.listChildren(ctx, tenant.Name)
+	ch, err := r.listChildren(ctx, &tenant)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -4562,7 +4581,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			setCondition(&tenant.Status.Conditions, v1alpha1.ConditionMimirRulesSynced, metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), gen)
 			setCondition(&tenant.Status.Conditions, v1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), gen)
 		} else {
-			n, err := r.syncRules(ctx, &tenant, mc, v1alpha1.BackendMimir, ch.MimirGroups)
+			n, err := r.syncRules(ctx, &tenant, mc, v1alpha1.BackendMimir, ch.MimirGroups, ch.KeepNamespaces)
 			keep(err)
 			tenant.Status.RuleGroups.Mimir = n
 			keep(r.syncAlertmanager(ctx, &tenant, mc, ch))
@@ -4578,7 +4597,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err != nil {
 			setCondition(&tenant.Status.Conditions, v1alpha1.ConditionLokiRulesSynced, metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), gen)
 		} else {
-			n, err := r.syncRules(ctx, &tenant, lc, v1alpha1.BackendLoki, ch.LokiGroups)
+			n, err := r.syncRules(ctx, &tenant, lc, v1alpha1.BackendLoki, ch.LokiGroups, ch.KeepNamespaces)
 			keep(err)
 			tenant.Status.RuleGroups.Loki = n
 		}
@@ -4587,16 +4606,30 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		tenant.Status.RuleGroups.Loki = 0
 	}
 
-	// Ready = every configured target condition is True.
+	// Ready = every configured target condition is True. A False condition always wins. An Unknown
+	// condition with ReasonNotConfigured is a backend the tenant doesn't use and never affects
+	// Ready. An Unknown condition with ReasonPending (syncAlertmanager, when ch.PendingAM: a
+	// ContactPoint/NotificationPolicy edit that hasn't been re-validated yet) means this pass has no
+	// new information, so Ready keeps whatever value it already had rather than jumping to True.
 	readyStatus, readyReason, readyMsg := metav1.ConditionTrue, v1alpha1.ReasonSynced, ""
+	pending := false
 	for _, typ := range []string{v1alpha1.ConditionAlertmanagerSynced, v1alpha1.ConditionMimirRulesSynced, v1alpha1.ConditionLokiRulesSynced} {
 		c := meta.FindStatusCondition(tenant.Status.Conditions, typ)
 		if c == nil || c.Status == metav1.ConditionUnknown {
+			if c != nil && c.Reason == v1alpha1.ReasonPending {
+				pending = true
+			}
 			continue
 		}
 		if c.Status == metav1.ConditionFalse {
 			readyStatus, readyReason, readyMsg = metav1.ConditionFalse, c.Reason, typ+": "+c.Message
+			pending = false
 			break
+		}
+	}
+	if pending {
+		if prev := meta.FindStatusCondition(base.Status.Conditions, v1alpha1.ConditionReady); prev != nil {
+			readyStatus, readyReason, readyMsg = prev.Status, prev.Reason, prev.Message
 		}
 	}
 	setCondition(&tenant.Status.Conditions, v1alpha1.ConditionReady, readyStatus, readyReason, readyMsg, gen)
@@ -4612,21 +4645,37 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if firstErr != nil {
 		return ctrl.Result{}, firstErr
 	}
-	return ctrl.Result{RequeueAfter: tenant.Resync()}, nil
+	// A pending child or a kept-but-not-yet-revalidated namespace means this Tenant is sitting on
+	// stale exclusions; the child's own status patch also re-enqueues via the watch, but this is a
+	// safety net so we don't wait a full resync interval to pick the fix up.
+	requeue := tenant.Resync()
+	if ch.PendingAM || len(ch.KeepNamespaces) > 0 {
+		requeue = 5 * time.Second
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
-// listChildren returns the Accepted children of a tenant, split by kind and backend.
-func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) (*children, error) {
-	sel := client.MatchingFields{index.IndexTenantRef: tenantName}
-	ch := &children{}
+// listChildren returns the Accepted children of a tenant, split by kind and backend, plus what's
+// pending: children (any of the three kinds) whose Accepted condition is stale — missing, or
+// ObservedGeneration < Generation — because a spec edit bumped Generation and this child's own
+// reconciler hasn't run yet. Those are neither desired (they're not in the returned slices) nor
+// prunable (an AlertRuleGroup's namespace lands in KeepNamespaces; a stale ContactPoint or
+// NotificationPolicy sets PendingAM). An object with Accepted=False at its current generation is a
+// validated rejection, not pending: it's simply excluded, same as before.
+func (r *TenantReconciler) listChildren(ctx context.Context, tenant *v1alpha1.Tenant) (*children, error) {
+	sel := client.MatchingFields{index.IndexTenantRef: tenant.Name}
+	ch := &children{KeepNamespaces: map[string]bool{}}
 
 	var cps v1alpha1.ContactPointList
 	if err := r.List(ctx, &cps, sel); err != nil {
 		return nil, err
 	}
 	for _, cp := range cps.Items {
-		if acceptedCurrent(&cp) {
+		switch {
+		case acceptedCurrent(&cp):
 			ch.ContactPoints = append(ch.ContactPoints, cp)
+		case staleGeneration(&cp):
+			ch.PendingAM = true
 		}
 	}
 
@@ -4636,8 +4685,11 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 	}
 	var accepted []v1alpha1.NotificationPolicy
 	for _, p := range pols.Items {
-		if acceptedCurrent(&p) {
+		switch {
+		case acceptedCurrent(&p):
 			accepted = append(accepted, p)
+		case staleGeneration(&p):
+			ch.PendingAM = true
 		}
 	}
 	ch.Policy = policyWinner(accepted)
@@ -4647,14 +4699,16 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 		return nil, err
 	}
 	for _, a := range args.Items {
-		if !acceptedCurrent(&a) {
-			continue
-		}
-		switch a.Spec.Backend {
-		case v1alpha1.BackendMimir:
-			ch.MimirGroups = append(ch.MimirGroups, a)
-		case v1alpha1.BackendLoki:
-			ch.LokiGroups = append(ch.LokiGroups, a)
+		switch {
+		case acceptedCurrent(&a):
+			switch a.Spec.Backend {
+			case v1alpha1.BackendMimir:
+				ch.MimirGroups = append(ch.MimirGroups, a)
+			case v1alpha1.BackendLoki:
+				ch.LokiGroups = append(ch.LokiGroups, a)
+			}
+		case staleGeneration(&a):
+			ch.KeepNamespaces[compile.BackendNamespace(tenant.Prefix(), a.Namespace, a.Name)] = true
 		}
 	}
 	return ch, nil
@@ -4666,6 +4720,15 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 func acceptedCurrent(obj v1alpha1.Conditioned) bool {
 	c := meta.FindStatusCondition(obj.GetConditions(), v1alpha1.ConditionAccepted)
 	return c != nil && c.Status == metav1.ConditionTrue && c.ObservedGeneration == obj.GetGeneration()
+}
+
+// staleGeneration is true when obj's Accepted condition has not yet been evaluated for its current
+// generation: missing, or ObservedGeneration < Generation. That's the window right after a spec
+// edit, before the child's own reconciler runs — not the same as Accepted=False at the current
+// generation, which is a validated rejection and must stay excluded/prunable.
+func staleGeneration(obj v1alpha1.Conditioned) bool {
+	c := meta.FindStatusCondition(obj.GetConditions(), v1alpha1.ConditionAccepted)
+	return c == nil || c.ObservedGeneration < obj.GetGeneration()
 }
 
 // backendOptions builds client options, resolving basic auth from a Secret with keys username/password.
@@ -4714,7 +4777,7 @@ func (r *TenantReconciler) lokiClient(ctx context.Context, tenant *v1alpha1.Tena
 
 // --- stubs replaced in Tasks 19 and 20 ---
 
-func (r *TenantReconciler) syncRules(_ context.Context, tenant *v1alpha1.Tenant, _ backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup) (int32, error) {
+func (r *TenantReconciler) syncRules(_ context.Context, tenant *v1alpha1.Tenant, _ backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, _ map[string]bool) (int32, error) {
 	typ := v1alpha1.ConditionMimirRulesSynced
 	if be == v1alpha1.BackendLoki {
 		typ = v1alpha1.ConditionLokiRulesSynced
@@ -4846,8 +4909,8 @@ git commit -m "feat(controller): Tenant reconciler skeleton with children listin
 - Consumes: `compile.Rules`, `compile.RulesEqual`, `compile.BackendNamespace` (Task 11); `compile.Alertmanager`, `compile.AlertmanagerInput`, `compile.SecretResolver`, `compile.AttributedError`, `compile.HashAlertmanager` (Task 12); `backend.RuleStore`, `backend.AlertmanagerStore`, `backend.IsUnavailable`, `backend.IsRejected` (Task 7); `syncedFromErr`, `patchStatus`, `setCondition` (Task 14); `children`, `TenantReconciler.lastAMSync` (Task 18).
 - Produces (same signatures as the Task 18 stubs):
 ```go
-func (r *TenantReconciler) syncRules(ctx, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup) (int32, error)
-func (r *TenantReconciler) syncAlertmanager(ctx, tenant *v1alpha1.Tenant, store backend.AlertmanagerStore, ch *children) error
+func (r *TenantReconciler) syncRules(ctx, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, keepNamespaces map[string]bool) (int32, error)  // keepNamespaces: skip in the diff loop, exclude from the prune loop
+func (r *TenantReconciler) syncAlertmanager(ctx, tenant *v1alpha1.Tenant, store backend.AlertmanagerStore, ch *children) error  // if ch.PendingAM: AlertmanagerSynced=Unknown/Pending, no compile, no POST
 func (r *TenantReconciler) secretResolver(ctx context.Context) compile.SecretResolver
 func (r *TenantReconciler) loadTemplates(ctx context.Context, tenant *v1alpha1.Tenant) (map[string]string, error)
 func (r *TenantReconciler) setChildSynced(ctx context.Context, obj v1alpha1.Conditioned, err error)  // patches Synced on a child; logs but does not fail on patch error
@@ -4867,6 +4930,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
@@ -4988,6 +5054,64 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 	}
 }
 
+// TestTenantKeepsStaleGenerationNamespace covers the race the controller must not lose: a spec edit
+// bumps an AlertRuleGroup's Generation and enqueues both its own reconciler and the Tenant
+// reconciler. If the Tenant runs first, acceptedCurrent is false for that group — without
+// KeepNamespaces, syncRules would read that as "no longer desired" and prune its backend namespace,
+// producing a transient alerting gap until the child re-validates. We force exactly that window by
+// patching the Accepted condition's ObservedGeneration back to the pre-edit generation and driving
+// the Tenant reconciler directly (bypassing the manager, so nothing else can race our read).
+func TestTenantKeepsStaleGenerationNamespace(t *testing.T) {
+	tn, srv := newFakeTenant(t, "stale-tenant", true, false) // mimir only
+
+	mimirG := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "stale-m", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: "mimir", Groups: ruleGroups("up == 0")}}
+	createAndCleanup(t, mimirG)
+	waitCondition(t, mimirG, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+	waitFor(t, func() bool { return len(srv.Rules("1")["alerts-operator/default/stale-m"]) == 1 })
+	oldGen := mimirG.Generation
+
+	// Edit the spec: Generation moves to oldGen+1.
+	mimirG.Spec.Groups[0].Rules[0].Expr = "up == 1"
+	if err := testClient.Update(testCtx, mimirG); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the child not having run yet: force Accepted back to the pre-edit generation.
+	if err := testClient.Get(testCtx, clientKey(mimirG), mimirG); err != nil {
+		t.Fatal(err)
+	}
+	setCondition(&mimirG.Status.Conditions, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted, "", oldGen)
+	if err := testClient.Status().Update(testCtx, mimirG); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.ResetRequests()
+	r := &TenantReconciler{Client: testClient, Recorder: record.NewFakeRecorder(20)}
+	if _, err := r.Reconcile(testCtx, ctrl.Request{NamespacedName: types.NamespacedName{Name: tn.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(srv.Rules("1")["alerts-operator/default/stale-m"]) != 1 {
+		t.Fatalf("stale-generation group's namespace must not be deleted: %+v", srv.Rules("1"))
+	}
+	if n := countPrefix(srv.Requests(), "DELETE"); n != 0 {
+		t.Fatalf("no DELETE expected for a stale-generation namespace: %v", srv.Requests())
+	}
+
+	// Let the child reconcile normally, then the Tenant picks up the new content.
+	waitFor(t, func() bool {
+		if err := testClient.Get(testCtx, clientKey(mimirG), mimirG); err != nil {
+			return false
+		}
+		return mimirG.Status.ObservedGeneration == mimirG.Generation
+	})
+	waitFor(t, func() bool {
+		rs := srv.Rules("1")["alerts-operator/default/stale-m"]
+		return len(rs) == 1 && rs[0].Rules[0].Expr == "up == 1"
+	})
+}
+
 func TestTenantWithoutPolicy(t *testing.T) {
 	tn, srv := newFakeTenant(t, "nopol-tenant", true, false)
 	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, observabilityv1alpha1.ReasonNoNotificationPolicy)
@@ -5052,9 +5176,14 @@ import (
 )
 
 // syncRules makes the backend's rule namespaces under the tenant prefix match the accepted groups.
-// It sets Mimir/LokiRulesSynced on the tenant and Synced on every group. The returned error is
-// non-nil only when the backend was unavailable (caller backs off).
-func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup) (int32, error) {
+// Namespaces in keep — backend namespaces of AlertRuleGroups whose Accepted condition is stale for
+// the current generation (see staleGeneration) — are left alone this pass: they're skipped in the
+// diff loop (in practice desired never contains them, since groups only has accepted-current
+// AlertRuleGroups) and, critically, excluded from the prune loop, so a spec edit racing ahead of its
+// own child reconciler can never make the Tenant reconciler prune a namespace whose new content just
+// hasn't been validated yet. It sets Mimir/LokiRulesSynced on the tenant and Synced on every group.
+// The returned error is non-nil only when the backend was unavailable (caller backs off).
+func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, keep map[string]bool) (int32, error) {
 	condType := v1alpha1.ConditionMimirRulesSynced
 	if be == v1alpha1.BackendLoki {
 		condType = v1alpha1.ConditionLokiRulesSynced
@@ -5079,6 +5208,9 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	nsErr := map[string]error{}
 	var count int32
 	for ns, want := range desired {
+		if keep[ns] {
+			continue
+		}
 		count += int32(len(want))
 		have := actual[ns]
 		if compile.RulesEqual(have, want) {
@@ -5113,6 +5245,9 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	}
 	var pruneErrs []error
 	for ns := range actual {
+		if keep[ns] {
+			continue
+		}
 		if _, wanted := desired[ns]; strings.HasPrefix(ns, prefix) && !wanted {
 			if err := store.DeleteNamespace(ctx, ns); err != nil {
 				pruneErrs = append(pruneErrs, err)
@@ -5223,6 +5358,15 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 		for i := range ch.ContactPoints {
 			r.setChildSynced(ctx, &ch.ContactPoints[i], err)
 		}
+	}
+
+	// A ContactPoint or the NotificationPolicy was just edited and hasn't been re-validated by its
+	// own reconciler yet (see listChildren/staleGeneration). Compiling now would risk either
+	// pushing a stale config or, if the edit dropped the last accepted policy, misreporting
+	// NoNotificationPolicy for what is really a transient gap. Wait: don't compile, don't POST.
+	if ch.PendingAM {
+		setTenant(metav1.ConditionUnknown, v1alpha1.ReasonPending, "waiting for child validation")
+		return nil
 	}
 
 	if ch.Policy == nil {
@@ -5352,7 +5496,7 @@ func (r *TenantReconciler) loadTemplates(ctx context.Context, tenant *v1alpha1.T
 - [ ] **Step 5: Run tests**
 
 Run: `make test`
-Expected: PASS. The "no POST on no-op" step relies on the child reconcilers and the Tenant reconciler skipping status patches when nothing changed (Tasks 14–18); if it flakes, that guard is what to inspect.
+Expected: PASS. The "no POST on no-op" step relies on the child reconcilers and the Tenant reconciler skipping status patches when nothing changed (Tasks 14–18); if it flakes, that guard is what to inspect. `TestTenantKeepsStaleGenerationNamespace` drives a `TenantReconciler` directly (bypassing the manager) so its assertions aren't racing the background controllers; if it flakes, check that nothing else patched `stale-m`'s Accepted condition between the forced-stale `Status().Update` and the direct `Reconcile` call.
 
 - [ ] **Step 6: Commit**
 
