@@ -14,10 +14,20 @@ spec:
     singular: contactpoint
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantRef
+      name: Tenant
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Synced")].status
+      name: Synced
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ContactPoint is the Schema for the contactpoints API
+        description: ContactPoint is the Schema for the contactpoints API.
         properties:
           apiVersion:
             description: |-
@@ -37,27 +47,300 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of ContactPoint
+            description: ContactPointSpec mirrors Alertmanager receiver configuration.
+              Secrets only via secretKeyRef.
             properties:
-              foo:
-                description: foo is an example field of ContactPoint. Edit contactpoint_types.go
-                  to remove/update
+              discord:
+                items:
+                  description: DiscordConfig specifies Discord notification settings.
+                  properties:
+                    message:
+                      type: string
+                    sendResolved:
+                      type: boolean
+                    title:
+                      type: string
+                    webhookURLSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - webhookURLSecretRef
+                  type: object
+                type: array
+              email:
+                items:
+                  description: EmailConfig specifies email notification settings.
+                  properties:
+                    authPasswordSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    authUsername:
+                      type: string
+                    from:
+                      type: string
+                    hello:
+                      type: string
+                    requireTLS:
+                      type: boolean
+                    sendResolved:
+                      type: boolean
+                    smarthost:
+                      type: string
+                    to:
+                      minLength: 1
+                      type: string
+                  required:
+                  - to
+                  type: object
+                type: array
+              pushover:
+                items:
+                  description: PushoverConfig specifies Pushover notification settings.
+                  properties:
+                    message:
+                      type: string
+                    priority:
+                      type: string
+                    sendResolved:
+                      type: boolean
+                    sound:
+                      type: string
+                    title:
+                      type: string
+                    tokenSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    url:
+                      type: string
+                    urlTitle:
+                      type: string
+                    userKeySecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - tokenSecretRef
+                  - userKeySecretRef
+                  type: object
+                type: array
+              slack:
+                items:
+                  description: SlackConfig specifies Slack notification settings.
+                  properties:
+                    apiURLSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    channel:
+                      type: string
+                    iconEmoji:
+                      type: string
+                    sendResolved:
+                      type: boolean
+                    text:
+                      type: string
+                    title:
+                      type: string
+                    username:
+                      type: string
+                  required:
+                  - apiURLSecretRef
+                  type: object
+                type: array
+              telegram:
+                items:
+                  description: TelegramConfig specifies Telegram notification settings.
+                  properties:
+                    botTokenSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    chatID:
+                      format: int64
+                      type: integer
+                    message:
+                      type: string
+                    parseMode:
+                      enum:
+                      - MarkdownV2
+                      - Markdown
+                      - HTML
+                      - ""
+                      type: string
+                    sendResolved:
+                      type: boolean
+                  required:
+                  - botTokenSecretRef
+                  - chatID
+                  type: object
+                type: array
+              tenantRef:
+                minLength: 1
                 type: string
+              webhook:
+                items:
+                  description: WebhookConfig specifies webhook notification settings
+                    with URL and HTTP authentication.
+                  properties:
+                    httpConfig:
+                      description: HTTPConfig specifies HTTP authentication options
+                        for webhook notifications.
+                      properties:
+                        basicAuth:
+                          description: HTTPBasicAuth specifies username and password
+                            for HTTP basic authentication.
+                          properties:
+                            passwordSecretRef:
+                              description: SecretKeyRef points at one key of a Secret
+                                in the same namespace as the referencing object.
+                              properties:
+                                key:
+                                  minLength: 1
+                                  type: string
+                                name:
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                            usernameSecretRef:
+                              description: SecretKeyRef points at one key of a Secret
+                                in the same namespace as the referencing object.
+                              properties:
+                                key:
+                                  minLength: 1
+                                  type: string
+                                name:
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                          required:
+                          - passwordSecretRef
+                          - usernameSecretRef
+                          type: object
+                        bearerTokenSecretRef:
+                          description: SecretKeyRef points at one key of a Secret
+                            in the same namespace as the referencing object.
+                          properties:
+                            key:
+                              minLength: 1
+                              type: string
+                            name:
+                              minLength: 1
+                              type: string
+                          required:
+                          - key
+                          - name
+                          type: object
+                      type: object
+                    maxAlerts:
+                      format: int32
+                      type: integer
+                    sendResolved:
+                      type: boolean
+                    url:
+                      minLength: 1
+                      type: string
+                    urlSecretRef:
+                      description: SecretKeyRef points at one key of a Secret in the
+                        same namespace as the referencing object.
+                      properties:
+                        key:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of url or urlSecretRef is required
+                    rule: has(self.url) != has(self.urlSecretRef)
+                type: array
+            required:
+            - tenantRef
             type: object
+            x-kubernetes-validations:
+            - message: at least one receiver configuration is required
+              rule: (has(self.webhook) && self.webhook.size() > 0) || (has(self.pushover)
+                && self.pushover.size() > 0) || (has(self.slack) && self.slack.size()
+                > 0) || (has(self.discord) && self.discord.size() > 0) || (has(self.telegram)
+                && self.telegram.size() > 0) || (has(self.email) && self.email.size()
+                > 0)
           status:
-            description: status defines the observed state of ContactPoint
+            description: ContactPointStatus defines the observed state of ContactPoint.
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the ContactPoint resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +399,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
             type: object
         required:
         - spec

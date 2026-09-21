@@ -21,70 +21,202 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// HTTPBasicAuth specifies username and password for HTTP basic authentication.
+type HTTPBasicAuth struct {
+	UsernameSecretRef SecretKeyRef `json:"usernameSecretRef"`
+	PasswordSecretRef SecretKeyRef `json:"passwordSecretRef"`
+}
 
-// ContactPointSpec defines the desired state of ContactPoint
-type ContactPointSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of ContactPoint. Edit contactpoint_types.go to remove/update
+// HTTPConfig specifies HTTP authentication options for webhook notifications.
+type HTTPConfig struct {
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	BearerTokenSecretRef *SecretKeyRef `json:"bearerTokenSecretRef,omitempty"`
+	// +optional
+	BasicAuth *HTTPBasicAuth `json:"basicAuth,omitempty"`
+}
+
+// WebhookConfig specifies webhook notification settings with URL and HTTP authentication.
+// +kubebuilder:validation:XValidation:rule="has(self.url) != has(self.urlSecretRef)",message="exactly one of url or urlSecretRef is required"
+type WebhookConfig struct {
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	URL string `json:"url,omitempty"`
+	// +optional
+	URLSecretRef *SecretKeyRef `json:"urlSecretRef,omitempty"`
+	// +optional
+	HTTPConfig *HTTPConfig `json:"httpConfig,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+	// +optional
+	MaxAlerts *int32 `json:"maxAlerts,omitempty"`
+}
+
+// PushoverConfig specifies Pushover notification settings.
+type PushoverConfig struct {
+	UserKeySecretRef SecretKeyRef `json:"userKeySecretRef"`
+	TokenSecretRef   SecretKeyRef `json:"tokenSecretRef"`
+	// +optional
+	Title string `json:"title,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// +optional
+	URL string `json:"url,omitempty"`
+	// +optional
+	URLTitle string `json:"urlTitle,omitempty"`
+	// +optional
+	Priority string `json:"priority,omitempty"`
+	// +optional
+	Sound string `json:"sound,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+}
+
+// SlackConfig specifies Slack notification settings.
+type SlackConfig struct {
+	APIURLSecretRef SecretKeyRef `json:"apiURLSecretRef"`
+	// +optional
+	Channel string `json:"channel,omitempty"`
+	// +optional
+	Username string `json:"username,omitempty"`
+	// +optional
+	Title string `json:"title,omitempty"`
+	// +optional
+	Text string `json:"text,omitempty"`
+	// +optional
+	IconEmoji string `json:"iconEmoji,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+}
+
+// DiscordConfig specifies Discord notification settings.
+type DiscordConfig struct {
+	WebhookURLSecretRef SecretKeyRef `json:"webhookURLSecretRef"`
+	// +optional
+	Title string `json:"title,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+}
+
+// TelegramConfig specifies Telegram notification settings.
+type TelegramConfig struct {
+	BotTokenSecretRef SecretKeyRef `json:"botTokenSecretRef"`
+	ChatID            int64        `json:"chatID"`
+	// +kubebuilder:validation:Enum=MarkdownV2;Markdown;HTML;""
+	// +optional
+	ParseMode string `json:"parseMode,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+}
+
+// EmailConfig specifies email notification settings.
+type EmailConfig struct {
+	// +kubebuilder:validation:MinLength=1
+	To string `json:"to"`
+	// +optional
+	From string `json:"from,omitempty"`
+	// +optional
+	Smarthost string `json:"smarthost,omitempty"`
+	// +optional
+	Hello string `json:"hello,omitempty"`
+	// +optional
+	AuthUsername string `json:"authUsername,omitempty"`
+	// +optional
+	AuthPasswordSecretRef *SecretKeyRef `json:"authPasswordSecretRef,omitempty"`
+	// +optional
+	RequireTLS *bool `json:"requireTLS,omitempty"`
+	// +optional
+	SendResolved *bool `json:"sendResolved,omitempty"`
+}
+
+// ContactPointSpec mirrors Alertmanager receiver configuration. Secrets only via secretKeyRef.
+// +kubebuilder:validation:XValidation:rule="(has(self.webhook) && self.webhook.size() > 0) || (has(self.pushover) && self.pushover.size() > 0) || (has(self.slack) && self.slack.size() > 0) || (has(self.discord) && self.discord.size() > 0) || (has(self.telegram) && self.telegram.size() > 0) || (has(self.email) && self.email.size() > 0)",message="at least one receiver configuration is required"
+type ContactPointSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	TenantRef string `json:"tenantRef"`
+	// +optional
+	Webhook []WebhookConfig `json:"webhook,omitempty"`
+	// +optional
+	Pushover []PushoverConfig `json:"pushover,omitempty"`
+	// +optional
+	Slack []SlackConfig `json:"slack,omitempty"`
+	// +optional
+	Discord []DiscordConfig `json:"discord,omitempty"`
+	// +optional
+	Telegram []TelegramConfig `json:"telegram,omitempty"`
+	// +optional
+	Email []EmailConfig `json:"email,omitempty"`
 }
 
 // ContactPointStatus defines the observed state of ContactPoint.
 type ContactPointStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the ContactPoint resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// +optional
 	// +listType=map
 	// +listMapKey=type
-	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// ContactPoint is the Schema for the contactpoints API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-
-// ContactPoint is the Schema for the contactpoints API
+// +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantRef`
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`
+// +kubebuilder:printcolumn:name="Synced",type=string,JSONPath=`.status.conditions[?(@.type=="Synced")].status`
 type ContactPoint struct {
-	metav1.TypeMeta `json:",inline"`
-
-	// metadata is a standard object metadata
-	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of ContactPoint
-	// +required
-	Spec ContactPointSpec `json:"spec"`
-
-	// status defines the observed state of ContactPoint
-	// +optional
-	Status ContactPointStatus `json:"status,omitzero"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ContactPointSpec   `json:"spec"`
+	Status            ContactPointStatus `json:"status,omitempty"`
 }
 
-// +kubebuilder:object:root=true
+// SecretRefs returns every secretKeyRef used by this ContactPoint, in declaration order.
+func (c *ContactPoint) SecretRefs() []SecretKeyRef {
+	var out []SecretKeyRef
+	add := func(r *SecretKeyRef) {
+		if r != nil {
+			out = append(out, *r)
+		}
+	}
+	for i := range c.Spec.Webhook {
+		w := &c.Spec.Webhook[i]
+		add(w.URLSecretRef)
+		if w.HTTPConfig != nil {
+			add(w.HTTPConfig.BearerTokenSecretRef)
+			if w.HTTPConfig.BasicAuth != nil {
+				add(&w.HTTPConfig.BasicAuth.UsernameSecretRef)
+				add(&w.HTTPConfig.BasicAuth.PasswordSecretRef)
+			}
+		}
+	}
+	for i := range c.Spec.Pushover {
+		add(&c.Spec.Pushover[i].UserKeySecretRef)
+		add(&c.Spec.Pushover[i].TokenSecretRef)
+	}
+	for i := range c.Spec.Slack {
+		add(&c.Spec.Slack[i].APIURLSecretRef)
+	}
+	for i := range c.Spec.Discord {
+		add(&c.Spec.Discord[i].WebhookURLSecretRef)
+	}
+	for i := range c.Spec.Telegram {
+		add(&c.Spec.Telegram[i].BotTokenSecretRef)
+	}
+	for i := range c.Spec.Email {
+		add(c.Spec.Email[i].AuthPasswordSecretRef)
+	}
+	return out
+}
 
-// ContactPointList contains a list of ContactPoint
+// ContactPointList contains a list of ContactPoint.
+// +kubebuilder:object:root=true
 type ContactPointList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ContactPoint `json:"items"`
 }
 
