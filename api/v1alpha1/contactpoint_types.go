@@ -28,6 +28,7 @@ type HTTPBasicAuth struct {
 }
 
 // HTTPConfig specifies HTTP authentication options for webhook notifications.
+// +kubebuilder:validation:XValidation:rule="!(has(self.bearerTokenSecretRef) && has(self.basicAuth))",message="bearerTokenSecretRef and basicAuth are mutually exclusive"
 type HTTPConfig struct {
 	// +optional
 	BearerTokenSecretRef *SecretKeyRef `json:"bearerTokenSecretRef,omitempty"`
@@ -48,6 +49,7 @@ type WebhookConfig struct {
 	// +optional
 	SendResolved *bool `json:"sendResolved,omitempty"`
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	MaxAlerts *int32 `json:"maxAlerts,omitempty"`
 }
 
@@ -100,6 +102,7 @@ type DiscordConfig struct {
 }
 
 // TelegramConfig specifies Telegram notification settings.
+// +kubebuilder:validation:XValidation:rule="self.chatID != 0",message="chatID must be non-zero"
 type TelegramConfig struct {
 	BotTokenSecretRef SecretKeyRef `json:"botTokenSecretRef"`
 	ChatID            int64        `json:"chatID"`

@@ -236,6 +236,9 @@ spec:
                   - botTokenSecretRef
                   - chatID
                   type: object
+                  x-kubernetes-validations:
+                  - message: chatID must be non-zero
+                    rule: self.chatID != 0
                 type: array
               tenantRef:
                 minLength: 1
@@ -300,8 +303,12 @@ spec:
                           - name
                           type: object
                       type: object
+                      x-kubernetes-validations:
+                      - message: bearerTokenSecretRef and basicAuth are mutually exclusive
+                        rule: '!(has(self.bearerTokenSecretRef) && has(self.basicAuth))'
                     maxAlerts:
                       format: int32
+                      minimum: 0
                       type: integer
                     sendResolved:
                       type: boolean
