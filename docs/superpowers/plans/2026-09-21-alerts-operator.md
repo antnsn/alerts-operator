@@ -90,14 +90,16 @@ Expected: prints `KubeBuilderVersion:"4.16.0"`.
 
 ```bash
 cd /Users/marius/repo/antnsn/alerts-operator
+mv docs .docs-tmp   # kubebuilder init refuses a dir that already holds non-hidden lowercase entries
 kubebuilder init --domain antnsn.dev --repo github.com/antnsn/alerts-operator --project-name alerts-operator
 kubebuilder create api --group observability --version v1alpha1 --kind Tenant --resource --controller --namespaced=false
 kubebuilder create api --group observability --version v1alpha1 --kind ContactPoint --resource --controller
 kubebuilder create api --group observability --version v1alpha1 --kind NotificationPolicy --resource --controller
 kubebuilder create api --group observability --version v1alpha1 --kind AlertRuleGroup --resource --controller
 make manifests generate
+mv .docs-tmp docs
 ```
-Expected: `config/crd/bases/observability.antnsn.dev_{tenants,contactpoints,notificationpolicies,alertrulegroups}.yaml` exist; `go build ./...` passes.
+Expected: `config/crd/bases/observability.antnsn.dev_{tenants,contactpoints,notificationpolicies,alertrulegroups}.yaml` exist; `docs/superpowers/` is back in place; `go build ./...` passes.
 
 - [ ] **Step 3: Replace Ginkgo test scaffolding with stdlib envtest suite**
 
@@ -1078,6 +1080,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 )
@@ -1110,8 +1113,6 @@ func TestRouteReceivers(t *testing.T) {
 	}
 }
 ```
-(add `"sigs.k8s.io/controller-runtime/pkg/client"` to imports.)
-
 - [ ] **Step 2: Run, expect failure**
 
 Run: `make test`
@@ -1707,6 +1708,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -1939,8 +1941,6 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, st *tenantS
 	}
 }
 ```
-(add `"net/url"` to imports.)
-
 - [ ] **Step 4: Run tests**
 
 Run: `go test ./internal/backend/... -v`
@@ -3713,7 +3713,7 @@ git commit -m "feat(controller): AlertRuleGroup validation and Accepted conditio
 ### Task 16: ContactPoint controller
 
 **Files:**
-- Modify: `internal/controller/contactpoint_controller.go`, `internal/controller/suite_test.go`
+- Modify: `internal/controller/contactpoint_controller.go`, `internal/controller/alertrulegroup_controller.go` (switch `tenantToRuleGroups` to `requestsFor`), `internal/controller/suite_test.go`
 - Test: `internal/controller/contactpoint_controller_test.go`
 
 **Interfaces:**
@@ -4235,7 +4235,7 @@ git commit -m "feat(controller): NotificationPolicy validation, receiver refs an
 - Test: `internal/controller/tenant_controller_test.go`
 
 **Interfaces:**
-- Consumes: `backend.Options`, `backend.RuleStore`, `backend.AlertmanagerStore`, `backend.BasicAuth` (Task 7); `mimir.New` (Task 9); `loki.New` (Task 10); `index.IndexTenantRef` (Task 13); `policyWinner` (Task 17); `setCondition`, `patchStatus`, `mapToTenant`, `requestsFor` (Tasks 14–16); `tenant.Prefix()`, `tenant.Resync()` (Task 3).
+- Consumes: `backend.Options`, `backend.RuleStore`, `backend.AlertmanagerStore`, `backend.BasicAuth` (Task 7); `mimir.New` (Task 9); `loki.New` (Task 10); `index.IndexTenantRef` (Task 13); `policyWinner` (Task 17); `setCondition`, `patchStatus`, `mapToTenant` (Task 14); `tenant.Prefix()`, `tenant.Resync()` (Task 3).
 - Produces:
 ```go
 const tenantFinalizer = "observability.antnsn.dev/tenant"
@@ -6487,7 +6487,6 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 ```bash
 make test          # envtest + unit tests
 make chart-test    # helm lint + render assertions
-make deploy-dev    # push :dev image and install into the current kube-context (docs/e2e.md)
 ```
 ````
 
@@ -6667,7 +6666,7 @@ git commit -m "ci: release workflow for multi-arch image and Helm chart, dependa
 
 **Files:**
 - Create: `docs/e2e.md`
-- Modify: `Makefile` (add `deploy-dev`, `undeploy-dev`)
+- Modify: `Makefile` (add `deploy-dev`, `undeploy-dev`), `README.md` (Development section)
 
 **Interfaces:**
 - Consumes: chart (Task 21), examples (Task 22), kubebuilder `docker-build`/`docker-push`/`docker-buildx` targets (`IMG` variable, `PLATFORMS` variable).
@@ -6837,10 +6836,21 @@ Record the run date and any deviations in the vault session note.
 Run: `make -n deploy-dev | head -3 && make -n undeploy-dev | head -1`
 Expected: shows the `docker-buildx` and `helm upgrade --install` lines, then `helm uninstall`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: README**
+
+In `README.md`, replace the `## Development` code block with:
 
 ```bash
-git add Makefile docs/e2e.md
+make test          # envtest + unit tests
+make chart-test    # helm lint + render assertions
+make deploy-dev    # push :dev image and install into the current kube-context (docs/e2e.md)
+make undeploy-dev  # remove the dev release and CRDs
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Makefile docs/e2e.md README.md
 git commit -m "build: deploy-dev target and home-cluster e2e runbook"
 ```
 
