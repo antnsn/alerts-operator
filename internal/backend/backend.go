@@ -60,5 +60,5 @@ type Options struct {
 	TenantID   string
 	BasicAuth  *BasicAuth
 	Timeout    time.Duration // default 30s
-	HTTPClient *http.Client  // default http.DefaultClient with Timeout
+	HTTPClient *http.Client  // nil → a new http.Client with Timeout; injected client is used as-is
 }

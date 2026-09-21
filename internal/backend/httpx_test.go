@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestHTTPTenantHeaderAndAuth(t *testing.T) {
@@ -23,6 +25,24 @@ func TestHTTPTenantHeaderAndAuth(t *testing.T) {
 	}
 	if gotTenant != "1" || gotAuth != "u:p" || gotPath != "/x/alerts-operator%2Fns%2Fname" {
 		t.Fatalf("tenant=%q auth=%q path=%q", gotTenant, gotAuth, gotPath)
+	}
+}
+
+func TestNewHTTPDoesNotMutateInjectedClient(t *testing.T) {
+	// Issue: when caller supplies HTTPClient and Options.Timeout,
+	// NewHTTP should not mutate the caller-owned client
+	injected := &http.Client{}
+	originalTimeout := injected.Timeout
+
+	_ = NewHTTP(Options{
+		Address:    "http://localhost:8080",
+		TenantID:   "1",
+		HTTPClient: injected,
+		Timeout:    time.Second,
+	})
+
+	if injected.Timeout != originalTimeout {
+		t.Fatalf("injected client was mutated: Timeout before=%v after=%v", originalTimeout, injected.Timeout)
 	}
 }
 
@@ -56,5 +76,29 @@ func TestHTTPErrorClassification(t *testing.T) {
 	srv.Close()
 	if _, _, err := h.Do(ctx, "GET", "/500", nil, ""); !IsUnavailable(err) {
 		t.Fatalf("connection refused should be unavailable: %v", err)
+	}
+}
+
+func TestHTTPOversizedRejectedBody(t *testing.T) {
+	// Issue: if reading a >=400 response body fails/truncates (e.g., exceeds 8 MiB limit),
+	// should still return StatusError so IsRejected is true, not IsUnavailable
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(400)
+		// Write a body larger than 8 MiB to trigger truncation
+		largebody := strings.Repeat("x", 9<<20)
+		_, _ = w.Write([]byte(largebody))
+	}))
+	defer srv.Close()
+
+	h := NewHTTP(Options{Address: srv.URL, TenantID: "1"})
+	ctx := context.Background()
+	_, _, err := h.Do(ctx, "GET", "/", nil, "")
+
+	// Even though body was oversized, this is a 400 so should be rejected
+	if !IsRejected(err) {
+		t.Fatalf("oversized 400 body should be rejected: %v (IsUnavailable=%v)", err, IsUnavailable(err))
+	}
+	if IsUnavailable(err) {
+		t.Fatalf("oversized 400 should not be unavailable: %v", err)
 	}
 }

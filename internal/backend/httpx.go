@@ -74,17 +74,15 @@ type HTTP struct {
 
 // NewHTTP creates a new HTTP client with the given options.
 func NewHTTP(o Options) *HTTP {
-	timeout := o.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
 	c := o.HTTPClient
 	if c == nil {
+		timeout := o.Timeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
 		c = &http.Client{Timeout: timeout}
-	} else if c.Timeout == 0 && o.Timeout > 0 {
-		// Apply explicit timeout to provided client if it had no timeout set
-		c.Timeout = o.Timeout
 	}
+	// Note: injected client is used as-is; caller owns it and controls timeout
 	return &HTTP{base: strings.TrimRight(o.Address, "/"), tenant: o.TenantID, auth: o.BasicAuth, client: c}
 }
 
@@ -109,19 +107,25 @@ func (h *HTTP) Do(ctx context.Context, method, path string, body []byte, content
 	const maxSize = 8 << 20 // 8MB
 	lr := io.LimitedReader{R: resp.Body, N: maxSize + 1}
 	respBody, err := io.ReadAll(&lr)
+
+	// For >=400 status, always return StatusError with the available body,
+	// even if the body read errored or truncated
+	if resp.StatusCode >= 400 {
+		return resp.StatusCode, respBody, &StatusError{Status: resp.StatusCode, Body: string(respBody)}
+	}
+
+	// For <400 status, surface any read errors
 	if err != nil {
 		return resp.StatusCode, nil, err
 	}
 	if lr.N < 1 {
 		return resp.StatusCode, nil, fmt.Errorf("response body exceeds %d bytes", maxSize)
 	}
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, respBody, &StatusError{Status: resp.StatusCode, Body: string(respBody)}
-	}
 	return resp.StatusCode, respBody, nil
 }
 
 // GetYAML decodes a YAML response into out. A 404 returns found=false, err=nil.
+// An empty 2xx body returns found=true without modifying out.
 func (h *HTTP) GetYAML(ctx context.Context, path string, out any) (bool, error) {
 	_, body, err := h.Do(ctx, http.MethodGet, path, nil, "")
 	if IsNotFound(err) {
