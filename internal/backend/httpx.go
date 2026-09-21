@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -150,6 +151,16 @@ func (h *HTTP) PostYAML(ctx context.Context, path string, in any) error {
 		return err
 	}
 	_, _, err = h.Do(ctx, http.MethodPost, path, body, "application/yaml")
+	return err
+}
+
+// PostJSON encodes in as JSON and POSTs it.
+func (h *HTTP) PostJSON(ctx context.Context, path string, in any) error {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	_, _, err = h.Do(ctx, http.MethodPost, path, body, "application/json")
 	return err
 }
 

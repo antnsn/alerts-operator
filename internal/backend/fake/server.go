@@ -2,6 +2,7 @@
 package fake
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -209,7 +210,14 @@ func (s *Server) handleAM(w http.ResponseWriter, r *http.Request, st *tenantStat
 	case http.MethodPost:
 		body, _ := io.ReadAll(r.Body)
 		var cfg backend.AlertmanagerConfig
-		if err := yaml.Unmarshal(body, &cfg); err != nil || cfg.Config == "" {
+		contentType := r.Header.Get("Content-Type")
+		var err error
+		if strings.Contains(contentType, "application/json") {
+			err = json.Unmarshal(body, &cfg)
+		} else {
+			err = yaml.Unmarshal(body, &cfg)
+		}
+		if err != nil || cfg.Config == "" {
 			http.Error(w, "error validating Alertmanager config: "+fmt.Sprint(err), http.StatusBadRequest)
 			return
 		}

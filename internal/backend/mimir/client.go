@@ -59,7 +59,7 @@ func (c *Client) Get(ctx context.Context) (*backend.AlertmanagerConfig, error) {
 
 // Set updates the Alertmanager config.
 func (c *Client) Set(ctx context.Context, cfg *backend.AlertmanagerConfig) error {
-	return c.h.PostYAML(ctx, amPath, cfg)
+	return c.h.PostJSON(ctx, amPath, cfg)
 }
 
 // Delete removes the Alertmanager config.
