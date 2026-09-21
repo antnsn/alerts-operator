@@ -81,6 +81,9 @@ func NewHTTP(o Options) *HTTP {
 	c := o.HTTPClient
 	if c == nil {
 		c = &http.Client{Timeout: timeout}
+	} else if c.Timeout == 0 && o.Timeout > 0 {
+		// Apply explicit timeout to provided client if it had no timeout set
+		c.Timeout = o.Timeout
 	}
 	return &HTTP{base: strings.TrimRight(o.Address, "/"), tenant: o.TenantID, auth: o.BasicAuth, client: c}
 }
@@ -103,9 +106,14 @@ func (h *HTTP) Do(ctx context.Context, method, path string, body []byte, content
 		return 0, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	const maxSize = 8 << 20 // 8MB
+	lr := io.LimitedReader{R: resp.Body, N: maxSize + 1}
+	respBody, err := io.ReadAll(&lr)
 	if err != nil {
 		return resp.StatusCode, nil, err
+	}
+	if lr.N < 1 {
+		return resp.StatusCode, nil, fmt.Errorf("response body exceeds %d bytes", maxSize)
 	}
 	if resp.StatusCode >= 400 {
 		return resp.StatusCode, respBody, &StatusError{Status: resp.StatusCode, Body: string(respBody)}
@@ -122,9 +130,7 @@ func (h *HTTP) GetYAML(ctx context.Context, path string, out any) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return true, nil
-	}
+	// Always unmarshal to properly clear the output parameter, even for empty bodies
 	if err := yaml.Unmarshal(body, out); err != nil {
 		return true, fmt.Errorf("decode %s: %w", path, err)
 	}
