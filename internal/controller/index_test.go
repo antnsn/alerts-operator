@@ -27,21 +27,21 @@ func TestIndexers(t *testing.T) {
 
 	waitFor(t, func() bool {
 		var cps observabilityv1alpha1.ContactPointList
-		if err := testClient.List(testCtx, &cps, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
+		if err := testCacheClient.List(testCtx, &cps, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
 			return false
 		}
 		return len(cps.Items) == 1 && cps.Items[0].Name == "idx-a"
 	})
 	waitFor(t, func() bool {
 		var cps observabilityv1alpha1.ContactPointList
-		if err := testClient.List(testCtx, &cps, client.InNamespace("default"), client.MatchingFields{index.IndexSecretRefs: "po"}); err != nil {
+		if err := testCacheClient.List(testCtx, &cps, client.InNamespace("default"), client.MatchingFields{index.IndexSecretRefs: "po"}); err != nil {
 			return false
 		}
 		return len(cps.Items) == 1 && cps.Items[0].Name == "idx-a"
 	})
 	waitFor(t, func() bool {
 		var cps observabilityv1alpha1.ContactPointList
-		if err := testClient.List(testCtx, &cps, client.MatchingFields{index.IndexSecretRefs: "hook"}); err != nil {
+		if err := testCacheClient.List(testCtx, &cps, client.MatchingFields{index.IndexSecretRefs: "hook"}); err != nil {
 			return false
 		}
 		return len(cps.Items) == 1 && cps.Items[0].Name == "idx-b"
@@ -49,10 +49,10 @@ func TestIndexers(t *testing.T) {
 	waitFor(t, func() bool {
 		var args observabilityv1alpha1.AlertRuleGroupList
 		var pols observabilityv1alpha1.NotificationPolicyList
-		if err := testClient.List(testCtx, &args, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
+		if err := testCacheClient.List(testCtx, &args, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
 			return false
 		}
-		if err := testClient.List(testCtx, &pols, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
+		if err := testCacheClient.List(testCtx, &pols, client.MatchingFields{index.IndexTenantRef: "idx-tenant-1"}); err != nil {
 			return false
 		}
 		return len(args.Items) == 1 && len(pols.Items) == 1

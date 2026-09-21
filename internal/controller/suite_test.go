@@ -21,8 +21,14 @@ import (
 var (
 	testCfg    *rest.Config
 	testClient client.Client
-	testCtx    context.Context
-	testCancel context.CancelFunc
+	// testCacheClient is the manager's cache-backed client. Field indexers registered via
+	// mgr.GetFieldIndexer() (internal/index) are a controller-runtime cache feature only —
+	// the API server has no knowledge of them — so MatchingFields queries must go through
+	// this client, not the uncached testClient. Reads through it are eventually consistent
+	// with writes, so callers must still poll with waitFor.
+	testCacheClient client.Client
+	testCtx         context.Context
+	testCancel      context.CancelFunc
 )
 
 // TestMain starts a shared envtest API server and a manager with all reconcilers.
@@ -39,6 +45,14 @@ func TestMain(m *testing.M) {
 	if err := observabilityv1alpha1.AddToScheme(scheme.Scheme); err != nil {
 		panic(err)
 	}
+	// testClient is an uncached, direct client (not mgr.GetClient()): it talks straight to
+	// the API server, so a Create followed immediately by a Get is guaranteed to observe the
+	// write. The manager's cache-backed client syncs asynchronously and would otherwise race
+	// tests that create then immediately read back.
+	testClient, err = client.New(testCfg, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		panic(err)
+	}
 	testCtx, testCancel = context.WithCancel(context.Background())
 	mgr, err := ctrl.NewManager(testCfg, ctrl.Options{
 		Scheme:  scheme.Scheme,
@@ -47,7 +61,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	testClient = mgr.GetClient()
+	testCacheClient = mgr.GetClient()
 	if err := index.Register(testCtx, mgr); err != nil {
 		panic(err)
 	}

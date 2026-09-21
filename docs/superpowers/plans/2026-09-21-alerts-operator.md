@@ -160,6 +160,14 @@ func TestMain(m *testing.M) {
 	if err := observabilityv1alpha1.AddToScheme(scheme.Scheme); err != nil {
 		panic(err)
 	}
+	// testClient is an uncached, direct client (not mgr.GetClient()): it talks straight to
+	// the API server, so a Create followed immediately by a Get is guaranteed to observe the
+	// write. The manager's cache-backed client syncs asynchronously and would otherwise race
+	// tests that create then immediately read back.
+	testClient, err = client.New(testCfg, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		panic(err)
+	}
 	testCtx, testCancel = context.WithCancel(context.Background())
 	mgr, err := ctrl.NewManager(testCfg, ctrl.Options{
 		Scheme:  scheme.Scheme,
@@ -168,7 +176,6 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	testClient = mgr.GetClient()
 	if err := setupReconcilers(mgr); err != nil {
 		panic(err)
 	}
