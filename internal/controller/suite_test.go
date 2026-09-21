@@ -15,6 +15,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/index"
 )
 
 var (
@@ -47,6 +48,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	testClient = mgr.GetClient()
+	if err := index.Register(testCtx, mgr); err != nil {
+		panic(err)
+	}
 	if err := setupReconcilers(mgr); err != nil {
 		panic(err)
 	}

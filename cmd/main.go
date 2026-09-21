@@ -18,6 +18,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -38,6 +39,7 @@ import (
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/controller"
+	"github.com/antnsn/alerts-operator/internal/index"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -180,6 +182,11 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
+		os.Exit(1)
+	}
+
+	if err := index.Register(context.Background(), mgr); err != nil {
+		setupLog.Error(err, "unable to register field indexers")
 		os.Exit(1)
 	}
 
