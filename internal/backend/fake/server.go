@@ -15,6 +15,11 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
+const (
+	mimirRulesBase = "/prometheus/config/v1/rules"
+	lokiRulesBase  = "/loki/api/v1/rules"
+)
+
 type tenantState struct {
 	mimir map[string][]backend.RuleGroup // Mimir ruler namespaces
 	loki  map[string][]backend.RuleGroup // Loki ruler namespaces
@@ -62,10 +67,43 @@ func (s *Server) LokiRules(tenant string) map[string][]backend.RuleGroup {
 	return copyRules(s.tenant(tenant).loki)
 }
 
+// copyRules deep-copies namespace -> groups so callers can't mutate server
+// state (including nested rule labels/annotations) through the returned map.
 func copyRules(in map[string][]backend.RuleGroup) map[string][]backend.RuleGroup {
 	out := map[string][]backend.RuleGroup{}
 	for ns, gs := range in {
-		out[ns] = append([]backend.RuleGroup(nil), gs...)
+		cp := make([]backend.RuleGroup, len(gs))
+		for i, g := range gs {
+			cp[i] = copyRuleGroup(g)
+		}
+		out[ns] = cp
+	}
+	return out
+}
+
+func copyRuleGroup(g backend.RuleGroup) backend.RuleGroup {
+	out := g
+	out.Rules = make([]backend.Rule, len(g.Rules))
+	for i, rule := range g.Rules {
+		out.Rules[i] = copyRule(rule)
+	}
+	return out
+}
+
+func copyRule(r backend.Rule) backend.Rule {
+	out := r
+	out.Labels = copyStringMap(r.Labels)
+	out.Annotations = copyStringMap(r.Annotations)
+	return out
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
 	return out
 }
@@ -79,6 +117,7 @@ func (s *Server) Alertmanager(tenant string) *backend.AlertmanagerConfig {
 		return nil
 	}
 	c := *am
+	c.TemplateFiles = copyStringMap(am.TemplateFiles)
 	return &c
 }
 
@@ -142,13 +181,19 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/api/v1/alerts":
 		s.handleAM(w, r, st)
-	case strings.HasPrefix(path, "/prometheus/config/v1/rules"):
-		s.handleRules(w, r, st.mimir, strings.TrimPrefix(path, "/prometheus/config/v1/rules"), false)
-	case strings.HasPrefix(path, "/loki/api/v1/rules"):
-		s.handleRules(w, r, st.loki, strings.TrimPrefix(path, "/loki/api/v1/rules"), true)
+	case matchesBase(path, mimirRulesBase):
+		s.handleRules(w, r, st.mimir, strings.TrimPrefix(path, mimirRulesBase), false)
+	case matchesBase(path, lokiRulesBase):
+		s.handleRules(w, r, st.loki, strings.TrimPrefix(path, lokiRulesBase), true)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// matchesBase reports whether path is exactly base or base followed by a
+// "/"-delimited suffix, so "/rules" doesn't also match "/rulesfoo".
+func matchesBase(path, base string) bool {
+	return path == base || strings.HasPrefix(path, base+"/")
 }
 
 func (s *Server) handleAM(w http.ResponseWriter, r *http.Request, st *tenantState) {
