@@ -1,0 +1,9 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: NotificationPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: alerts-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: notificationpolicy-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,7 @@
+## Append samples of your project ##
+resources:
+- observability_v1alpha1_tenant.yaml
+- observability_v1alpha1_contactpoint.yaml
+- observability_v1alpha1_notificationpolicy.yaml
+- observability_v1alpha1_alertrulegroup.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

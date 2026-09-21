@@ -1,0 +1,41 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - observability.antnsn.dev
+  resources:
+  - alertrulegroups
+  - contactpoints
+  - notificationpolicies
+  - tenants
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - observability.antnsn.dev
+  resources:
+  - alertrulegroups/finalizers
+  - contactpoints/finalizers
+  - notificationpolicies/finalizers
+  - tenants/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - observability.antnsn.dev
+  resources:
+  - alertrulegroups/status
+  - contactpoints/status
+  - notificationpolicies/status
+  - tenants/status
+  verbs:
+  - get
+  - patch
+  - update
