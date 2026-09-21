@@ -3,8 +3,10 @@ package compile
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"sigs.k8s.io/yaml"
 
@@ -27,6 +29,52 @@ func (e *AttributedError) Error() string {
 	return fmt.Sprintf("%s %s/%s: %v", e.Kind, e.Namespace, e.Name, e.Err)
 }
 func (e *AttributedError) Unwrap() error { return e.Err }
+
+// secretRecorder wraps a SecretResolver, recording every non-empty value it resolves over the
+// lifetime of one Alertmanager() call. Alertmanager's own config/template errors can embed raw
+// field values verbatim (e.g. a url.Parse failure quotes the whole URL it was given), so every
+// error this package returns is passed through redact() first to keep secret values out of
+// status conditions and events.
+type secretRecorder struct {
+	inner  SecretResolver
+	values map[string]struct{}
+}
+
+func newSecretRecorder(inner SecretResolver) *secretRecorder {
+	return &secretRecorder{inner: inner, values: map[string]struct{}{}}
+}
+
+// resolve satisfies SecretResolver, recording the value before returning it.
+func (r *secretRecorder) resolve(namespace, name, key string) (string, error) {
+	v, err := r.inner(namespace, name, key)
+	if v != "" {
+		r.values[v] = struct{}{}
+	}
+	return v, err
+}
+
+// redact replaces every recorded secret value in msg with "[REDACTED]". Longest values are
+// replaced first so a value that is a substring of another isn't left partially redacted.
+func (r *secretRecorder) redact(msg string) string {
+	vals := make([]string, 0, len(r.values))
+	for v := range r.values {
+		vals = append(vals, v)
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	for _, v := range vals {
+		msg = strings.ReplaceAll(msg, v, "[REDACTED]")
+	}
+	return msg
+}
+
+// attribute wraps a non-nil err as an *AttributedError with its message redacted of any secret
+// value resolved so far. Returns nil when err is nil.
+func (r *secretRecorder) attribute(kind, namespace, name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &AttributedError{Kind: kind, Namespace: namespace, Name: name, Err: errors.New(r.redact(err.Error()))}
+}
 
 // AlertmanagerInput is everything needed to compile one tenant's Alertmanager document.
 type AlertmanagerInput struct {
@@ -141,15 +189,22 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 	if in.Policy == nil {
 		return nil, fmt.Errorf("no NotificationPolicy")
 	}
+	rec := newSecretRecorder(in.Secrets)
 	cfg := amConfig{}
 
-	// Receivers from every ContactPoint, deterministic order.
+	// Receivers from every ContactPoint, deterministic order. Each receiver is also validated in
+	// isolation so a receiver-specific failure (malformed webhook/Slack URL, bad email settings,
+	// ...) is attributed to the ContactPoint that produced it, not folded into the whole-document
+	// validation below (which is attributed to the policy).
 	byName := map[string]bool{}
 	for i := range in.ContactPoints {
 		cp := &in.ContactPoints[i]
-		rcv, err := compileReceiver(cp, in.Secrets)
+		rcv, err := compileReceiver(cp, rec.resolve)
 		if err != nil {
-			return nil, &AttributedError{Kind: "ContactPoint", Namespace: cp.Namespace, Name: cp.Name, Err: err}
+			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
+		}
+		if err := validateReceiver(rcv); err != nil {
+			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
 		}
 		cfg.Receivers = append(cfg.Receivers, rcv)
 		byName[rcv.Name] = true
@@ -160,7 +215,7 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 	pol := in.Policy
 	route, err := compileRoute(&pol.Spec.Route, pol.Namespace, byName)
 	if err != nil {
-		return nil, &AttributedError{Kind: "NotificationPolicy", Namespace: pol.Namespace, Name: pol.Name, Err: err}
+		return nil, rec.attribute("NotificationPolicy", pol.Namespace, pol.Name, err)
 	}
 	cfg.Route = route
 	for _, ir := range pol.Spec.InhibitRules {
@@ -175,12 +230,13 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 
 	raw, err := yaml.Marshal(cfg)
 	if err != nil {
-		return nil, err
+		return nil, errors.New(rec.redact(err.Error()))
 	}
 	out := &backend.AlertmanagerConfig{Config: string(raw), TemplateFiles: in.Templates}
 	if err := ValidateAlertmanager(out); err != nil {
-		// Alertmanager validation errors are about structure/durations/matchers: attribute to the policy.
-		return nil, &AttributedError{Kind: "NotificationPolicy", Namespace: pol.Namespace, Name: pol.Name, Err: err}
+		// Whole-document validation covers route/matchers/durations/inhibit/templates: attribute
+		// to the policy. Receiver-specific failures are caught earlier, per-receiver, above.
+		return nil, rec.attribute("NotificationPolicy", pol.Namespace, pol.Name, err)
 	}
 	return out, nil
 }

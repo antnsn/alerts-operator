@@ -99,6 +99,62 @@ func TestAlertmanagerAttributesErrors(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Kind != "NotificationPolicy" {
 		t.Fatalf("expected decode-error attribution, got %v", err)
 	}
+
+	// Receiver-level failures (e.g. a malformed webhook URL) must be attributed to the
+	// offending ContactPoint, not folded into whole-document validation attributed to the policy.
+	in = fullInput()
+	in.Secrets = secrets(map[string]string{
+		"monitoring/po/user": "U", "monitoring/po/token": "T", "monitoring/keep/api-key": "K",
+		"monitoring/slack/url": "https://hooks.slack.com/x", "monitoring/discord/url": "https://discord.com/api/webhooks/x",
+		"monitoring/tg/token": "TG", "monitoring/smtp/pw": "PW", "team-b/hook/url": "not-a-url",
+	})
+	_, err = Alertmanager(in)
+	if !errors.As(err, &ae) || ae.Kind != "ContactPoint" || ae.Namespace != "team-b" || ae.Name != "other" {
+		t.Fatalf("expected ContactPoint attribution for invalid receiver, got %v", err)
+	}
+}
+
+func TestAlertmanagerRedactsSecretsFromErrors(t *testing.T) {
+	in := fullInput()
+	// A trailing control character makes Go's url.Parse itself fail with an error that embeds
+	// the full raw string it was given -- this is the leak vector: Alertmanager's config loader
+	// surfaces url.Parse errors verbatim, and secret values must never reach that text.
+	in.Secrets = secrets(map[string]string{
+		"monitoring/po/user": "U", "monitoring/po/token": "T", "monitoring/keep/api-key": "K",
+		"monitoring/slack/url": "https://hooks.slack.com/services/SECRET-VALUE\n", "monitoring/discord/url": "https://discord.com/api/webhooks/x",
+		"monitoring/tg/token": "TG", "monitoring/smtp/pw": "PW", "team-b/hook/url": "http://hook",
+	})
+	_, err := Alertmanager(in)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "SECRET-VALUE") {
+		t.Fatalf("secret value leaked into error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] marker, got %v", err)
+	}
+}
+
+func TestAlertmanagerTemplateRewriteScopedToTemplatesKey(t *testing.T) {
+	// "default.tmpl" cannot itself be used here: it contains a "." and so is never a valid
+	// Alertmanager group_by label name (`^[a-zA-Z_][a-zA-Z0-9_]*$`), which would make this test
+	// fail regardless of the bug under test. "clashname" is a valid label name that still
+	// collides textually with the template's map key, which is what the whole-document
+	// string-replace bug actually depended on.
+	in := fullInput()
+	in.Policy.Spec.Route.GroupBy = []string{"alertname", "clashname"}
+	in.Templates = map[string]string{"clashname": `{{ define "x" }}ok{{ end }}`}
+	cfg, err := Alertmanager(in)
+	if err != nil {
+		t.Fatalf("expected valid config despite group_by/template name collision, got %v", err)
+	}
+	if !strings.Contains(cfg.Config, "- clashname\n") {
+		t.Fatalf("group_by entry corrupted or missing:\n%s", cfg.Config)
+	}
+	if strings.Contains(cfg.Config, "am-templates-") {
+		t.Fatalf("cfg.Config leaked a validation temp path:\n%s", cfg.Config)
+	}
 }
 
 func TestAlertmanagerRejectsBrokenTemplate(t *testing.T) {

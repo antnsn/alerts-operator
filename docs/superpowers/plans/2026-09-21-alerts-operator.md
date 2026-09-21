@@ -2697,8 +2697,10 @@ package compile
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"sigs.k8s.io/yaml"
 
@@ -2722,6 +2724,53 @@ func (e *AttributedError) Error() string {
 }
 func (e *AttributedError) Unwrap() error { return e.Err }
 
+// secretRecorder wraps a SecretResolver, recording every non-empty value it resolves over the
+// lifetime of one Alertmanager() call. Alertmanager's own config/template errors can embed raw
+// field values verbatim (e.g. a url.Parse failure quotes the whole URL it was given), so every
+// error this package returns is passed through redact() first to keep secret values out of
+// status conditions and events.
+type secretRecorder struct {
+	inner  SecretResolver
+	values map[string]struct{}
+}
+
+func newSecretRecorder(inner SecretResolver) *secretRecorder {
+	return &secretRecorder{inner: inner, values: map[string]struct{}{}}
+}
+
+// resolve satisfies SecretResolver, recording the value before returning it.
+func (r *secretRecorder) resolve(namespace, name, key string) (string, error) {
+	v, err := r.inner(namespace, name, key)
+	if v != "" {
+		r.values[v] = struct{}{}
+	}
+	return v, err
+}
+
+// redact replaces every recorded secret value in msg with "[REDACTED]". Longest values are
+// replaced first so a value that is a substring of another isn't left partially redacted.
+func (r *secretRecorder) redact(msg string) string {
+	vals := make([]string, 0, len(r.values))
+	for v := range r.values {
+		vals = append(vals, v)
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	for _, v := range vals {
+		msg = strings.ReplaceAll(msg, v, "[REDACTED]")
+	}
+	return msg
+}
+
+// attribute wraps a non-nil err as an *AttributedError with its message redacted of any secret
+// value resolved so far. Returns nil when err is nil.
+func (r *secretRecorder) attribute(kind, namespace, name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &AttributedError{Kind: kind, Namespace: namespace, Name: name, Err: errors.New(r.redact(err.Error()))}
+}
+
+// AlertmanagerInput is everything needed to compile one tenant's Alertmanager document.
 type AlertmanagerInput struct {
 	Policy        *v1alpha1.NotificationPolicy
 	ContactPoints []v1alpha1.ContactPoint
@@ -2834,15 +2883,22 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 	if in.Policy == nil {
 		return nil, fmt.Errorf("no NotificationPolicy")
 	}
+	rec := newSecretRecorder(in.Secrets)
 	cfg := amConfig{}
 
-	// Receivers from every ContactPoint, deterministic order.
+	// Receivers from every ContactPoint, deterministic order. Each receiver is also validated in
+	// isolation so a receiver-specific failure (malformed webhook/Slack URL, bad email settings,
+	// ...) is attributed to the ContactPoint that produced it, not folded into the whole-document
+	// validation below (which is attributed to the policy).
 	byName := map[string]bool{}
 	for i := range in.ContactPoints {
 		cp := &in.ContactPoints[i]
-		rcv, err := compileReceiver(cp, in.Secrets)
+		rcv, err := compileReceiver(cp, rec.resolve)
 		if err != nil {
-			return nil, &AttributedError{Kind: "ContactPoint", Namespace: cp.Namespace, Name: cp.Name, Err: err}
+			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
+		}
+		if err := validateReceiver(rcv); err != nil {
+			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
 		}
 		cfg.Receivers = append(cfg.Receivers, rcv)
 		byName[rcv.Name] = true
@@ -2853,7 +2909,7 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 	pol := in.Policy
 	route, err := compileRoute(&pol.Spec.Route, pol.Namespace, byName)
 	if err != nil {
-		return nil, &AttributedError{Kind: "NotificationPolicy", Namespace: pol.Namespace, Name: pol.Name, Err: err}
+		return nil, rec.attribute("NotificationPolicy", pol.Namespace, pol.Name, err)
 	}
 	cfg.Route = route
 	for _, ir := range pol.Spec.InhibitRules {
@@ -2868,12 +2924,13 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 
 	raw, err := yaml.Marshal(cfg)
 	if err != nil {
-		return nil, err
+		return nil, errors.New(rec.redact(err.Error()))
 	}
 	out := &backend.AlertmanagerConfig{Config: string(raw), TemplateFiles: in.Templates}
 	if err := ValidateAlertmanager(out); err != nil {
-		// Alertmanager validation errors are about structure/durations/matchers: attribute to the policy.
-		return nil, &AttributedError{Kind: "NotificationPolicy", Namespace: pol.Namespace, Name: pol.Name, Err: err}
+		// Whole-document validation covers route/matchers/durations/inhibit/templates: attribute
+		// to the policy. Receiver-specific failures are caught earlier, per-receiver, above.
+		return nil, rec.attribute("NotificationPolicy", pol.Namespace, pol.Name, err)
 	}
 	return out, nil
 }
@@ -3005,18 +3062,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/prometheus/promql/parser"
+	"sigs.k8s.io/yaml"
 
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
 // ValidateAlertmanager runs Alertmanager's own config loader on the compiled document and
 // parses the template files the same way Alertmanager does at startup (config.Load alone
-// does not touch templates). Template names are rewritten to real temp files first.
+// does not touch templates). Template names are rewritten to real temp files first, scoped
+// strictly to the document's "templates" key: the document is unmarshaled into a generic map
+// and only that key is replaced, so a matcher, group_by label, or receiver name that happens to
+// equal a template name is never touched.
 func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 	text := cfg.Config
 	var paths []string
@@ -3025,15 +3085,25 @@ func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 		if err != nil {
 			return err
 		}
-		defer os.RemoveAll(dir)
+		defer os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup of a temp dir
+
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(text), &doc); err != nil {
+			return fmt.Errorf("alertmanager config: %w", err)
+		}
 		for name, body := range cfg.TemplateFiles {
 			p := filepath.Join(dir, name)
 			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 				return err
 			}
-			text = strings.ReplaceAll(text, "- "+name+"\n", "- "+p+"\n")
 			paths = append(paths, p)
 		}
+		doc["templates"] = paths
+		raw, err := yaml.Marshal(doc)
+		if err != nil {
+			return fmt.Errorf("alertmanager config: %w", err)
+		}
+		text = string(raw)
 	}
 	if _, err := amconfig.Load(text); err != nil {
 		return fmt.Errorf("alertmanager config: %w", err)
@@ -3046,14 +3116,38 @@ func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 	return nil
 }
 
+// validateReceiver runs Alertmanager's config loader against a single receiver in isolation
+// (wrapped in the smallest valid document: a root route that points at it and nothing else), so
+// receiver-specific failures -- a malformed webhook/Slack URL, invalid email settings, and so on
+// -- surface here and can be attributed to the ContactPoint that produced them, rather than
+// being folded into the whole-document validation in ValidateAlertmanager.
+func validateReceiver(rcv amReceiver) error {
+	doc := amConfig{Route: &amRoute{Receiver: rcv.Name}, Receivers: []amReceiver{rcv}}
+	raw, err := yaml.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	if _, err := amconfig.Load(string(raw)); err != nil {
+		return fmt.Errorf("receiver: %w", err)
+	}
+	return nil
+}
+
+// promqlParser is stateless (holds only Options) and safe for concurrent use; shared across calls.
+var promqlParser = parser.NewParser(parser.Options{})
+
 // ValidatePromQL parses a Mimir rule expression.
 func ValidatePromQL(expr string) error {
-	_, err := parser.ParseExpr(expr)
+	_, err := promqlParser.ParseExpr(expr)
 	return err
 }
 ```
 
 Run `go get github.com/prometheus/alertmanager@v0.34.1 github.com/prometheus/prometheus@v0.314.0 && go mod tidy`. If `go mod tidy` reports replace-directive conflicts from the prometheus module, copy the `replace` lines it names from prometheus's own `go.mod` into ours and re-run.
+
+Note: `github.com/prometheus/prometheus/promql/parser` at the pinned `v0.314.0` no longer exports a package-level `ParseExpr`; it moved to a method on a `Parser` interface obtained via `parser.NewParser(parser.Options{})`. `ValidatePromQL`'s exported signature is unaffected.
+
+Fix round 1 (post-Step-5, same task): a Codex review flagged that folding every `ValidateAlertmanager` failure into a `NotificationPolicy`-attributed error mis-attributes receiver-specific failures (a malformed webhook/Slack URL, say) that actually belong to a `ContactPoint`. `Alertmanager()` now validates each compiled receiver in isolation (`validateReceiver`, minimal `{route: {receiver: <name>}, receivers: [<rcv>]}` doc) immediately after compiling it, before it's added to the document; only failures from the remaining whole-document validation (route/matchers/durations/inhibit/templates) are attributed to the policy. The same round also closed two other findings: (1) `amconfig.Load` (and `url.Parse` in particular) can embed raw secret values verbatim in its error text, so every error `Alertmanager()` returns is now passed through a `secretRecorder` that redacts every value resolved during that call before the error is returned; (2) the old whole-document `strings.ReplaceAll(text, "- "+name+"\n", ...)` template-path rewrite could corrupt an unrelated matcher/group_by/receiver value that happened to equal a template name, so the rewrite is now scoped to the document's `templates` key via an unmarshal/replace-key/remarshal round trip.
 
 - [ ] **Step 4: Golden + run**
 
