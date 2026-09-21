@@ -52,8 +52,22 @@ func TestMain(m *testing.M) {
 	}
 	mgrDone := make(chan error, 1)
 	go func() { mgrDone <- mgr.Start(testCtx) }()
-	if !mgr.GetCache().WaitForCacheSync(testCtx) {
-		panic("cache sync failed")
+
+	// Race the cache sync against the manager exiting early: if mgr.Start fails
+	// before it ever starts the cache, WaitForCacheSync would otherwise block
+	// forever since nothing else cancels testCtx on that path.
+	cacheSynced := make(chan bool, 1)
+	go func() { cacheSynced <- mgr.GetCache().WaitForCacheSync(testCtx) }()
+	select {
+	case err := <-mgrDone:
+		if err != nil {
+			panic(err)
+		}
+		panic("manager exited before cache sync")
+	case ok := <-cacheSynced:
+		if !ok {
+			panic("cache sync failed")
+		}
 	}
 	code := m.Run()
 	testCancel()
