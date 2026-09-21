@@ -14,10 +14,23 @@ spec:
     singular: alertrulegroup
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantRef
+      name: Tenant
+      type: string
+    - jsonPath: .spec.backend
+      name: Backend
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Synced")].status
+      name: Synced
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: AlertRuleGroup is the Schema for the alertrulegroups API
+        description: AlertRuleGroup is the Schema for the alertrulegroups API.
         properties:
           apiVersion:
             description: |-
@@ -37,27 +50,90 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of AlertRuleGroup
+            description: |-
+              AlertRuleGroupSpec defines the desired state of AlertRuleGroup.
+              Group-name uniqueness is enforced by +listType=map on Groups (no CEL needed).
             properties:
-              foo:
-                description: foo is an example field of AlertRuleGroup. Edit alertrulegroup_types.go
-                  to remove/update
+              backend:
+                description: Backend specifies which backend (Mimir or Loki) to use
+                  for alert rules.
+                enum:
+                - mimir
+                - loki
                 type: string
+              groups:
+                items:
+                  description: RuleGroup is a collection of alert and recording rules
+                    grouped by name.
+                  properties:
+                    interval:
+                      type: string
+                    name:
+                      minLength: 1
+                      type: string
+                    rules:
+                      items:
+                        description: Rule is one alerting or recording rule (PrometheusRule-compatible
+                          shape).
+                        properties:
+                          alert:
+                            minLength: 1
+                            type: string
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          expr:
+                            description: 'Expr must be a YAML string. PrometheusRule
+                              allows a bare number (IntOrString); quote it here, e.g.
+                              expr: "1".'
+                            minLength: 1
+                            type: string
+                          for:
+                            type: string
+                          keep_firing_for:
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          record:
+                            minLength: 1
+                            type: string
+                        required:
+                        - expr
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of alert or record must be set
+                          rule: has(self.alert) != has(self.record)
+                      minItems: 1
+                      type: array
+                  required:
+                  - name
+                  - rules
+                  type: object
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              tenantRef:
+                description: TenantRef is the name of the cluster-scoped Tenant.
+                minLength: 1
+                type: string
+            required:
+            - backend
+            - groups
+            - tenantRef
             type: object
           status:
-            description: status defines the observed state of AlertRuleGroup
+            description: AlertRuleGroupStatus defines the observed state of AlertRuleGroup.
             properties:
+              backendNamespace:
+                description: BackendNamespace is the rule namespace used in the backend,
+                  <prefix>/<namespace>/<name>.
+                type: string
               conditions:
-                description: |-
-                  conditions represent the current state of the AlertRuleGroup resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,9 +192,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
             type: object
-        required:
-        - spec
         type: object
     served: true
     storage: true

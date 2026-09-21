@@ -21,70 +21,94 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// Backend specifies which backend (Mimir or Loki) to use for alert rules.
+// +kubebuilder:validation:Enum=mimir;loki
+type Backend string
 
-// AlertRuleGroupSpec defines the desired state of AlertRuleGroup
-type AlertRuleGroupSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+const (
+	// BackendMimir uses Grafana Mimir for alert rules.
+	BackendMimir Backend = "mimir"
+	// BackendLoki uses Grafana Loki for alert rules.
+	BackendLoki Backend = "loki"
+)
 
-	// foo is an example field of AlertRuleGroup. Edit alertrulegroup_types.go to remove/update
+// Rule is one alerting or recording rule (PrometheusRule-compatible shape).
+// +kubebuilder:validation:XValidation:rule="has(self.alert) != has(self.record)",message="exactly one of alert or record must be set"
+type Rule struct {
+	// +kubebuilder:validation:MinLength=1
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Record string `json:"record,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	Alert string `json:"alert,omitempty"`
+	// Expr must be a YAML string. PrometheusRule allows a bare number (IntOrString); quote it here, e.g. expr: "1".
+	// +kubebuilder:validation:MinLength=1
+	Expr string `json:"expr"`
+	// +optional
+	For string `json:"for,omitempty"`
+	// +optional
+	KeepFiringFor string `json:"keep_firing_for,omitempty"`
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// RuleGroup is a collection of alert and recording rules grouped by name.
+type RuleGroup struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +optional
+	Interval string `json:"interval,omitempty"`
+	// +kubebuilder:validation:MinItems=1
+	Rules []Rule `json:"rules"`
+}
+
+// AlertRuleGroupSpec defines the desired state of AlertRuleGroup.
+// Group-name uniqueness is enforced by +listType=map on Groups (no CEL needed).
+type AlertRuleGroupSpec struct {
+	// TenantRef is the name of the cluster-scoped Tenant.
+	// +kubebuilder:validation:MinLength=1
+	TenantRef string  `json:"tenantRef"`
+	Backend   Backend `json:"backend"`
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
+	Groups []RuleGroup `json:"groups"`
 }
 
 // AlertRuleGroupStatus defines the observed state of AlertRuleGroup.
 type AlertRuleGroupStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the AlertRuleGroup resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// +optional
 	// +listType=map
 	// +listMapKey=type
-	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// BackendNamespace is the rule namespace used in the backend, <prefix>/<namespace>/<name>.
+	// +optional
+	BackendNamespace string `json:"backendNamespace,omitempty"`
 }
 
+// AlertRuleGroup is the Schema for the alertrulegroups API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-
-// AlertRuleGroup is the Schema for the alertrulegroups API
+// +kubebuilder:printcolumn:name="Tenant",type=string,JSONPath=`.spec.tenantRef`
+// +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=`.spec.backend`
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`
+// +kubebuilder:printcolumn:name="Synced",type=string,JSONPath=`.status.conditions[?(@.type=="Synced")].status`
 type AlertRuleGroup struct {
-	metav1.TypeMeta `json:",inline"`
-
-	// metadata is a standard object metadata
-	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of AlertRuleGroup
-	// +required
-	Spec AlertRuleGroupSpec `json:"spec"`
-
-	// status defines the observed state of AlertRuleGroup
-	// +optional
-	Status AlertRuleGroupStatus `json:"status,omitzero"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              AlertRuleGroupSpec   `json:"spec,omitempty"`
+	Status            AlertRuleGroupStatus `json:"status,omitempty"`
 }
 
+// AlertRuleGroupList contains a list of AlertRuleGroup.
 // +kubebuilder:object:root=true
-
-// AlertRuleGroupList contains a list of AlertRuleGroup
 type AlertRuleGroupList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AlertRuleGroup `json:"items"`
 }
 
