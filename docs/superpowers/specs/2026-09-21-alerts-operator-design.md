@@ -141,7 +141,8 @@ status:
 ```
 
 Backend rule namespace = `<prefix>/<k8s-namespace>/<name>`. Group names unique
-within one CR (CEL). `backend: loki` requires `tenant.spec.loki`; `mimir` requires
+within one CR (`listType=map` on `groups`). `expr` is a string: PrometheusRule's bare-number
+form (`expr: 1`, IntOrString) must be quoted (`expr: "1"`); otherwise groups paste in unchanged. `backend: loki` requires `tenant.spec.loki`; `mimir` requires
 `tenant.spec.mimir` (checked at reconcile).
 
 ## 3. Reconcile model
@@ -295,6 +296,7 @@ GitHub Actions:
 ## 9. Decisions recorded
 
 - Own CRDs, Grafana-style object model, instead of reusing PrometheusRule/AlertmanagerConfig (portfolio clarity, no Alloy overlap).
+- Sync functions return an error to controller-runtime (backoff) only for unavailable backends (transport/5xx); 4xx and compile errors set conditions and wait for the next change or resync.
 - Cluster-scoped Tenant + namespaced children (platform owns connection, teams own content).
 - Single-writer Tenant reconciler (Alertmanager config is one document per tenant; prune and atomicity are simpler).
 - Receiver schema mirrors Alertmanager natively; secrets only via `secretKeyRef`.

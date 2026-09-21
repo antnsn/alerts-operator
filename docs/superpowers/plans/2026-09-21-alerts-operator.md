@@ -98,8 +98,14 @@ kubebuilder create api --group observability --version v1alpha1 --kind Notificat
 kubebuilder create api --group observability --version v1alpha1 --kind AlertRuleGroup --resource --controller
 make manifests generate
 mv .docs-tmp docs
+# kubebuilder scaffolds an older Go directive / controller-runtime; pin the stack from the plan header.
+go mod edit -go=1.27
+go get sigs.k8s.io/controller-runtime@v0.25.1
+go mod tidy
+grep -nE '^(ARG BASE_IMAGE|FROM)' Dockerfile
 ```
-Expected: `config/crd/bases/observability.antnsn.dev_{tenants,contactpoints,notificationpolicies,alertrulegroups}.yaml` exist; `docs/superpowers/` is back in place; `go build ./...` passes.
+If the Dockerfile has `ARG BASE_IMAGE=golang:<old>`, change it to `ARG BASE_IMAGE=golang:1.27`; if the builder line is a literal `FROM golang:<old> AS builder`, change it to `golang:1.27`. The final stage must be `FROM gcr.io/distroless/static:nonroot` (kubebuilder default; leave it).
+Expected: `config/crd/bases/observability.antnsn.dev_{tenants,contactpoints,notificationpolicies,alertrulegroups}.yaml` exist; `docs/superpowers/` is back in place; `go.mod` says `go 1.27` and `sigs.k8s.io/controller-runtime v0.25.1`; `go build ./...` passes.
 
 - [ ] **Step 3: Replace Ginkgo test scaffolding with stdlib envtest suite**
 
@@ -166,16 +172,17 @@ func TestMain(m *testing.M) {
 	if err := setupReconcilers(mgr); err != nil {
 		panic(err)
 	}
-	go func() {
-		if err := mgr.Start(testCtx); err != nil {
-			panic(err)
-		}
-	}()
+	mgrDone := make(chan error, 1)
+	go func() { mgrDone <- mgr.Start(testCtx) }()
 	if !mgr.GetCache().WaitForCacheSync(testCtx) {
 		panic("cache sync failed")
 	}
 	code := m.Run()
 	testCancel()
+	// Let the manager and its reconcilers drain before the API server goes away.
+	if err := <-mgrDone; err != nil {
+		panic(err)
+	}
 	_ = testEnv.Stop()
 	os.Exit(code)
 }
@@ -668,10 +675,13 @@ const (
 // Rule is one alerting or recording rule (PrometheusRule-compatible shape).
 // +kubebuilder:validation:XValidation:rule="has(self.alert) != has(self.record)",message="exactly one of alert or record must be set"
 type Rule struct {
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	Record string `json:"record,omitempty"`
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	Alert string `json:"alert,omitempty"`
+	// Expr must be a YAML string. PrometheusRule allows a bare number (IntOrString); quote it here, e.g. expr: "1".
 	// +kubebuilder:validation:MinLength=1
 	Expr string `json:"expr"`
 	// +optional
@@ -694,13 +704,15 @@ type RuleGroup struct {
 }
 
 // AlertRuleGroupSpec defines the desired state of AlertRuleGroup.
-// +kubebuilder:validation:XValidation:rule="self.groups.map(g, g.name).size() == self.groups.map(g, g.name).unique().size()",message="group names must be unique"
+// Group-name uniqueness is enforced by +listType=map on Groups (no CEL needed).
 type AlertRuleGroupSpec struct {
 	// TenantRef is the name of the cluster-scoped Tenant.
 	// +kubebuilder:validation:MinLength=1
 	TenantRef string `json:"tenantRef"`
 	Backend   Backend `json:"backend"`
 	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
 	Groups []RuleGroup `json:"groups"`
 }
 
@@ -741,7 +753,7 @@ func init() {
 }
 ```
 
-Note: CEL `unique()` requires Kubernetes ≥1.31 (`sets` library, available in envtest 1.31+ and the home cluster). If `make manifests` or envtest rejects it, replace the rule with `self.groups.all(g, self.groups.filter(h, h.name == g.name).size() == 1)`.
+Note: Kubernetes CEL has no list `unique()`; duplicate group names are rejected by the API server through `+listType=map`/`+listMapKey=name` (the "dup group" case fails admission with a duplicate-key error).
 
 - [ ] **Step 4: Regenerate and test**
 
@@ -803,6 +815,7 @@ func TestContactPointCEL(t *testing.T) {
 		{"webhook url", observabilityv1alpha1.ContactPointSpec{TenantRef: "t", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}}, false},
 		{"no receivers", observabilityv1alpha1.ContactPointSpec{TenantRef: "t"}, true},
 		{"webhook without url or ref", observabilityv1alpha1.ContactPointSpec{TenantRef: "t", Webhook: []observabilityv1alpha1.WebhookConfig{{}}}, true},
+		{"webhook with both url and ref", observabilityv1alpha1.ContactPointSpec{TenantRef: "t", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x", URLSecretRef: &observabilityv1alpha1.SecretKeyRef{Name: "s", Key: "k"}}}}, true},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -856,8 +869,9 @@ type HTTPConfig struct {
 	BasicAuth *HTTPBasicAuth `json:"basicAuth,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="has(self.url) || has(self.urlSecretRef)",message="url or urlSecretRef is required"
+// +kubebuilder:validation:XValidation:rule="has(self.url) != has(self.urlSecretRef)",message="exactly one of url or urlSecretRef is required"
 type WebhookConfig struct {
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	URL string `json:"url,omitempty"`
 	// +optional
@@ -1584,16 +1598,18 @@ git commit -m "feat(backend): types, store interfaces and shared HTTP transport"
 package fake
 type Server struct { *httptest.Server; ... }
 func New() *Server
-func (s *Server) Rules(tenant string) map[string][]backend.RuleGroup           // copy
+func (s *Server) Rules(tenant string) map[string][]backend.RuleGroup           // copy of the Mimir ruler state
+func (s *Server) LokiRules(tenant string) map[string][]backend.RuleGroup       // copy of the Loki ruler state
 func (s *Server) Alertmanager(tenant string) *backend.AlertmanagerConfig      // copy or nil
-func (s *Server) SetRules(tenant, ns string, groups []backend.RuleGroup)      // seed
+func (s *Server) SetRules(tenant, ns string, groups []backend.RuleGroup)      // seed Mimir
+func (s *Server) SetLokiRules(tenant, ns string, groups []backend.RuleGroup)  // seed Loki
 func (s *Server) SetAlertmanager(tenant string, cfg *backend.AlertmanagerConfig)
 func (s *Server) Fail(status int)     // every request returns status until Fail(0)
 func (s *Server) RejectPost(msg string) // POSTs return 400 msg until RejectPost("")
 func (s *Server) Requests() []string   // "METHOD path" log
 func (s *Server) ResetRequests()
 ```
-Paths served: Mimir `/prometheus/config/v1/rules[/{ns}[/{group}]]`, `/api/v1/alerts`; Loki `/loki/api/v1/rules[/{ns}[/{group}]]`. Loki per-group GET deliberately returns 404 with a non-JSON body to mirror Loki 3.6.7. State keyed by `X-Scope-OrgID`; missing header → 401.
+Paths served: Mimir `/prometheus/config/v1/rules[/{ns}[/{group}]]`, `/api/v1/alerts`; Loki `/loki/api/v1/rules[/{ns}[/{group}]]`. Mimir and Loki rules live in **separate** maps so one server can stand in for both backends of a Tenant without the two syncs pruning each other. Loki per-group GET deliberately returns 404 with a non-JSON body to mirror Loki 3.6.7. State keyed by `X-Scope-OrgID`; missing header → 401.
 
 - [ ] **Step 1: Failing test**
 
@@ -1649,7 +1665,10 @@ func TestFakeMimirRulesRoundTrip(t *testing.T) {
 func TestFakeLokiPerGroupGetIsBroken(t *testing.T) {
 	s := New()
 	defer s.Close()
-	s.SetRules("1", "p/ns/a", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "A", Expr: `{job="x"} |= "err"`}}}})
+	s.SetLokiRules("1", "p/ns/a", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "A", Expr: `{job="x"} |= "err"`}}}})
+	if len(s.Rules("1")) != 0 {
+		t.Fatal("loki seed must not appear in the mimir map")
+	}
 	code, body := do(t, "GET", s.URL+"/loki/api/v1/rules/p%2Fns%2Fa/g", "")
 	if code != 404 || body == "" {
 		t.Fatalf("expected malformed 404, got %d %q", code, body)
@@ -1718,7 +1737,8 @@ import (
 )
 
 type tenantState struct {
-	rules map[string][]backend.RuleGroup
+	mimir map[string][]backend.RuleGroup // Mimir ruler namespaces
+	loki  map[string][]backend.RuleGroup // Loki ruler namespaces
 	am    *backend.AlertmanagerConfig
 }
 
@@ -1740,7 +1760,7 @@ func New() *Server {
 func (s *Server) tenant(id string) *tenantState {
 	t, ok := s.tenants[id]
 	if !ok {
-		t = &tenantState{rules: map[string][]backend.RuleGroup{}}
+		t = &tenantState{mimir: map[string][]backend.RuleGroup{}, loki: map[string][]backend.RuleGroup{}}
 		s.tenants[id] = t
 	}
 	return t
@@ -1749,8 +1769,18 @@ func (s *Server) tenant(id string) *tenantState {
 func (s *Server) Rules(tenant string) map[string][]backend.RuleGroup {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return copyRules(s.tenant(tenant).mimir)
+}
+
+func (s *Server) LokiRules(tenant string) map[string][]backend.RuleGroup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return copyRules(s.tenant(tenant).loki)
+}
+
+func copyRules(in map[string][]backend.RuleGroup) map[string][]backend.RuleGroup {
 	out := map[string][]backend.RuleGroup{}
-	for ns, gs := range s.tenant(tenant).rules {
+	for ns, gs := range in {
 		out[ns] = append([]backend.RuleGroup(nil), gs...)
 	}
 	return out
@@ -1770,7 +1800,13 @@ func (s *Server) Alertmanager(tenant string) *backend.AlertmanagerConfig {
 func (s *Server) SetRules(tenant, ns string, groups []backend.RuleGroup) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tenant(tenant).rules[ns] = append([]backend.RuleGroup(nil), groups...)
+	s.tenant(tenant).mimir[ns] = append([]backend.RuleGroup(nil), groups...)
+}
+
+func (s *Server) SetLokiRules(tenant, ns string, groups []backend.RuleGroup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tenant(tenant).loki[ns] = append([]backend.RuleGroup(nil), groups...)
 }
 
 func (s *Server) SetAlertmanager(tenant string, cfg *backend.AlertmanagerConfig) {
@@ -1812,9 +1848,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/alerts":
 		s.handleAM(w, r, st)
 	case strings.HasPrefix(path, "/prometheus/config/v1/rules"):
-		s.handleRules(w, r, st, strings.TrimPrefix(path, "/prometheus/config/v1/rules"), false)
+		s.handleRules(w, r, st.mimir, strings.TrimPrefix(path, "/prometheus/config/v1/rules"), false)
 	case strings.HasPrefix(path, "/loki/api/v1/rules"):
-		s.handleRules(w, r, st, strings.TrimPrefix(path, "/loki/api/v1/rules"), true)
+		s.handleRules(w, r, st.loki, strings.TrimPrefix(path, "/loki/api/v1/rules"), true)
 	default:
 		http.NotFound(w, r)
 	}
@@ -1866,19 +1902,19 @@ func unescape(s string) (string, error) {
 	return url.PathUnescape(s)
 }
 
-func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, st *tenantState, rest string, loki bool) {
+func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[string][]backend.RuleGroup, rest string, loki bool) {
 	seg := segments(rest)
 	switch {
 	case r.Method == http.MethodGet && len(seg) == 0:
-		if len(st.rules) == 0 {
+		if len(rules) == 0 {
 			http.Error(w, "no rule groups found", http.StatusNotFound)
 			return
 		}
-		b, _ := yaml.Marshal(st.rules)
+		b, _ := yaml.Marshal(rules)
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(b)
 	case r.Method == http.MethodGet && len(seg) == 1:
-		gs, ok := st.rules[seg[0]]
+		gs, ok := rules[seg[0]]
 		if !ok {
 			http.Error(w, "namespace not found", http.StatusNotFound)
 			return
@@ -1892,7 +1928,7 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, st *tenantS
 			_, _ = w.Write([]byte("<html>not found</html>"))
 			return
 		}
-		for _, g := range st.rules[seg[0]] {
+		for _, g := range rules[seg[0]] {
 			if g.Name == seg[1] {
 				b, _ := yaml.Marshal(g)
 				_, _ = w.Write(b)
@@ -1909,31 +1945,31 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, st *tenantS
 		}
 		ns := seg[0]
 		replaced := false
-		for i := range st.rules[ns] {
-			if st.rules[ns][i].Name == g.Name {
-				st.rules[ns][i] = g
+		for i := range rules[ns] {
+			if rules[ns][i].Name == g.Name {
+				rules[ns][i] = g
 				replaced = true
 			}
 		}
 		if !replaced {
-			st.rules[ns] = append(st.rules[ns], g)
+			rules[ns] = append(rules[ns], g)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	case r.Method == http.MethodDelete && len(seg) == 1:
-		delete(st.rules, seg[0])
+		delete(rules, seg[0])
 		w.WriteHeader(http.StatusAccepted)
 	case r.Method == http.MethodDelete && len(seg) == 2:
 		ns := seg[0]
 		var kept []backend.RuleGroup
-		for _, g := range st.rules[ns] {
+		for _, g := range rules[ns] {
 			if g.Name != seg[1] {
 				kept = append(kept, g)
 			}
 		}
 		if len(kept) == 0 {
-			delete(st.rules, ns)
+			delete(rules, ns)
 		} else {
-			st.rules[ns] = kept
+			rules[ns] = kept
 		}
 		w.WriteHeader(http.StatusAccepted)
 	default:
@@ -2315,13 +2351,19 @@ func TestRulesGolden(t *testing.T) {
 
 func TestRulesEqualIgnoresOrder(t *testing.T) {
 	a := []backend.RuleGroup{{Name: "a", Rules: []backend.Rule{{Alert: "x", Expr: "1"}}}, {Name: "b", Rules: []backend.Rule{{Alert: "y", Expr: "2"}}}}
-	b := []backend.RuleGroup{a[1], a[0]}
+	b := []backend.RuleGroup{{Name: "b", Rules: []backend.Rule{{Alert: "y", Expr: "2"}}}, {Name: "a", Rules: []backend.Rule{{Alert: "x", Expr: "1"}}}}
 	if !RulesEqual(a, b) {
 		t.Fatal("order should not matter")
 	}
 	b[0].Rules[0].Expr = "3"
 	if RulesEqual(a, b) {
 		t.Fatal("content change must be detected")
+	}
+	// Comparing must not mutate the inputs (normalize deep-copies).
+	c := []backend.RuleGroup{{Name: "c", Rules: []backend.Rule{{Alert: "z", Expr: "1", Labels: map[string]string{}}}}}
+	_ = RulesEqual(c, c)
+	if c[0].Rules[0].Labels == nil {
+		t.Fatal("RulesEqual mutated its input")
 	}
 }
 ```
@@ -2381,20 +2423,23 @@ func RulesEqual(a, b []backend.RuleGroup) bool {
 	return reflect.DeepEqual(normalize(a), normalize(b))
 }
 
+// normalize returns a deep copy sorted by group name with empty maps nil-ed; inputs are never mutated.
 func normalize(in []backend.RuleGroup) []backend.RuleGroup {
 	out := make([]backend.RuleGroup, len(in))
-	copy(out, in)
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	for i := range out {
-		for j := range out[i].Rules {
-			if len(out[i].Rules[j].Labels) == 0 {
-				out[i].Rules[j].Labels = nil
+	for i, g := range in {
+		g.Rules = make([]backend.Rule, len(in[i].Rules))
+		for j, r := range in[i].Rules {
+			if len(r.Labels) == 0 {
+				r.Labels = nil
 			}
-			if len(out[i].Rules[j].Annotations) == 0 {
-				out[i].Rules[j].Annotations = nil
+			if len(r.Annotations) == 0 {
+				r.Annotations = nil
 			}
+			g.Rules[j] = r
 		}
+		out[i] = g
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -2543,6 +2588,15 @@ func TestAlertmanagerAttributesErrors(t *testing.T) {
 	_, err = Alertmanager(in)
 	if !errors.As(err, &ae) || ae.Kind != "NotificationPolicy" {
 		t.Fatalf("expected validation attributed to policy, got %v", err)
+	}
+}
+
+func TestAlertmanagerRejectsBrokenTemplate(t *testing.T) {
+	in := fullInput()
+	in.Templates = map[string]string{"bad.tmpl": `{{ define "x" }}{{ .Unclosed `}
+	_, err := Alertmanager(in)
+	if err == nil || !strings.Contains(err.Error(), "templates") {
+		t.Fatalf("expected template parse error, got %v", err)
 	}
 }
 
@@ -2878,15 +2932,18 @@ import (
 	"strings"
 
 	amconfig "github.com/prometheus/alertmanager/config"
+	amtemplate "github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
-// ValidateAlertmanager runs Alertmanager's own config loader on the compiled document.
-// Template names are rewritten to real temp files so `templates:` entries resolve.
+// ValidateAlertmanager runs Alertmanager's own config loader on the compiled document and
+// parses the template files the same way Alertmanager does at startup (config.Load alone
+// does not touch templates). Template names are rewritten to real temp files first.
 func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 	text := cfg.Config
+	var paths []string
 	if len(cfg.TemplateFiles) > 0 {
 		dir, err := os.MkdirTemp("", "am-templates-")
 		if err != nil {
@@ -2899,10 +2956,16 @@ func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 				return err
 			}
 			text = strings.ReplaceAll(text, "- "+name+"\n", "- "+p+"\n")
+			paths = append(paths, p)
 		}
 	}
 	if _, err := amconfig.Load(text); err != nil {
 		return fmt.Errorf("alertmanager config: %w", err)
+	}
+	if len(paths) > 0 {
+		if _, err := amtemplate.FromGlobs(paths); err != nil {
+			return fmt.Errorf("alertmanager templates: %w", err)
+		}
 	}
 	return nil
 }
@@ -3126,7 +3189,7 @@ type Conditioned interface { client.Object; GetConditions() []metav1.Condition; 
 
 // internal/controller
 func setCondition(conds *[]metav1.Condition, typ string, status metav1.ConditionStatus, reason, msg string, gen int64) bool
-func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate func()) error  // merge patch on status subresource with optimistic lock
+func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate func(), changed *bool) error  // merge patch on status subresource with optimistic lock; skipped when *changed is false after mutate (nil = always patch)
 func tenantRequest(name string) reconcile.Request
 func tenantRefOf(o client.Object) string                                     // "" for unknown kinds
 func mapToTenant(ctx context.Context, o client.Object) []reconcile.Request   // for handler.EnqueueRequestsFromMapFunc
@@ -3204,6 +3267,20 @@ func TestMapToTenant(t *testing.T) {
 	}
 	if got := mapToTenant(context.Background(), &observabilityv1alpha1.Tenant{}); got != nil {
 		t.Fatalf("tenant should not map: %v", got)
+	}
+}
+
+func TestPatchStatusSkipsWhenUnchanged(t *testing.T) {
+	obj := &observabilityv1alpha1.Tenant{}
+	obj.Name = "never-created"
+	unchanged := false
+	// Would fail with NotFound if a patch were sent; a skipped patch returns nil.
+	if err := patchStatus(testCtx, testClient, obj, func() {}, &unchanged); err != nil {
+		t.Fatalf("unchanged patch should be skipped: %v", err)
+	}
+	changed := true
+	if err := patchStatus(testCtx, testClient, obj, func() {}, &changed); err == nil {
+		t.Fatal("changed patch must be sent (and fail NotFound here)")
 	}
 }
 
@@ -3296,9 +3373,17 @@ func setCondition(conds *[]metav1.Condition, typ string, status metav1.Condition
 // The optimistic lock makes a concurrent status writer (e.g. the Tenant reconciler
 // setting Synced while a child sets Accepted) surface as a conflict → requeue,
 // instead of one side silently overwriting the other's conditions.
-func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate func()) error {
+//
+// mutate reports through *changed whether anything differs; when it says false the
+// patch is skipped. This matters: an optimistic-lock patch always carries
+// metadata.resourceVersion, so an unconditional patch bumps the object, fires a
+// watch event and re-enqueues every controller watching it — a hot loop.
+func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate func(), changed *bool) error {
 	base := obj.DeepCopyObject().(client.Object)
 	mutate()
+	if changed != nil && !*changed {
+		return nil
+	}
 	return c.Status().Patch(ctx, obj, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
@@ -3623,11 +3708,13 @@ func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
+	changed := false
 	err := patchStatus(ctx, r.Client, &arg, func() {
-		setCondition(&arg.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, arg.Generation)
+		changed = setCondition(&arg.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, arg.Generation)
+		changed = changed || arg.Status.ObservedGeneration != arg.Generation || arg.Status.BackendNamespace != backendNS
 		arg.Status.ObservedGeneration = arg.Generation
 		arg.Status.BackendNamespace = backendNS
-	})
+	}, &changed)
 	return ctrl.Result{}, err
 }
 
@@ -3852,10 +3939,12 @@ func (r *ContactPointReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
+	changed := false
 	err := patchStatus(ctx, r.Client, &cp, func() {
-		setCondition(&cp.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, cp.Generation)
+		changed = setCondition(&cp.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, cp.Generation)
+		changed = changed || cp.Status.ObservedGeneration != cp.Generation
 		cp.Status.ObservedGeneration = cp.Generation
-	})
+	}, &changed)
 	return ctrl.Result{}, err
 }
 
@@ -4106,10 +4195,12 @@ func (r *NotificationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	changed := false
 	err = patchStatus(ctx, r.Client, &pol, func() {
-		setCondition(&pol.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, pol.Generation)
+		changed = setCondition(&pol.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, pol.Generation)
+		changed = changed || pol.Status.ObservedGeneration != pol.Generation
 		pol.Status.ObservedGeneration = pol.Generation
-	})
+	}, &changed)
 	return ctrl.Result{}, err
 }
 
@@ -4250,7 +4341,8 @@ type TenantReconciler struct {
 	lastAMSync map[string]time.Time                    // tenant name → last successful Alertmanager sync
 }
 type children struct { ContactPoints []v1alpha1.ContactPoint; Policy *v1alpha1.NotificationPolicy; MimirGroups, LokiGroups []v1alpha1.AlertRuleGroup }
-func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) (*children, error)  // Accepted=True only; Policy = policyWinner among accepted
+func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) (*children, error)  // Accepted=True for the current generation only; Policy = policyWinner among accepted
+func acceptedCurrent(obj v1alpha1.Conditioned) bool
 func (r *TenantReconciler) backendOptions(ctx context.Context, tenant *v1alpha1.Tenant, spec *v1alpha1.BackendSpec) (backend.Options, error)
 func (r *TenantReconciler) mimirClient(ctx, tenant) (MimirClient, error)
 func (r *TenantReconciler) lokiClient(ctx, tenant) (backend.RuleStore, error)
@@ -4351,6 +4443,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4417,9 +4510,10 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, nil
 		}
 		if err := r.finalize(ctx, &tenant); err != nil {
+			deletingChanged := false
 			_ = patchStatus(ctx, r.Client, &tenant, func() {
-				setCondition(&tenant.Status.Conditions, v1alpha1.ConditionReady, metav1.ConditionFalse, v1alpha1.ReasonDeleting, err.Error(), tenant.Generation)
-			})
+				deletingChanged = setCondition(&tenant.Status.Conditions, v1alpha1.ConditionReady, metav1.ConditionFalse, v1alpha1.ReasonDeleting, err.Error(), tenant.Generation)
+			}, &deletingChanged)
 			r.Recorder.Eventf(&tenant, corev1.EventTypeWarning, "FinalizeFailed", "%v", err)
 			return ctrl.Result{}, err
 		}
@@ -4494,8 +4588,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	setCondition(&tenant.Status.Conditions, v1alpha1.ConditionReady, readyStatus, readyReason, readyMsg, gen)
 
 	tenant.Status.ObservedGeneration = gen
-	if err := r.Status().Patch(ctx, &tenant, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-		return ctrl.Result{}, err
+	// Only patch when status really changed (see patchStatus for why an unconditional
+	// optimistic-lock patch would loop).
+	if !equality.Semantic.DeepEqual(base.Status, tenant.Status) {
+		if err := r.Status().Patch(ctx, &tenant, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if firstErr != nil {
 		return ctrl.Result{}, firstErr
@@ -4513,7 +4611,7 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 		return nil, err
 	}
 	for _, cp := range cps.Items {
-		if meta.IsStatusConditionTrue(cp.Status.Conditions, v1alpha1.ConditionAccepted) {
+		if acceptedCurrent(&cp) {
 			ch.ContactPoints = append(ch.ContactPoints, cp)
 		}
 	}
@@ -4524,7 +4622,7 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 	}
 	var accepted []v1alpha1.NotificationPolicy
 	for _, p := range pols.Items {
-		if meta.IsStatusConditionTrue(p.Status.Conditions, v1alpha1.ConditionAccepted) {
+		if acceptedCurrent(&p) {
 			accepted = append(accepted, p)
 		}
 	}
@@ -4535,7 +4633,7 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 		return nil, err
 	}
 	for _, a := range args.Items {
-		if !meta.IsStatusConditionTrue(a.Status.Conditions, v1alpha1.ConditionAccepted) {
+		if !acceptedCurrent(&a) {
 			continue
 		}
 		switch a.Spec.Backend {
@@ -4546,6 +4644,14 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenantName string) 
 		}
 	}
 	return ch, nil
+}
+
+// acceptedCurrent is true only when Accepted=True was set for the object's current generation.
+// A freshly edited spec still carries the previous generation's Accepted=True until its own
+// reconciler runs; without this check the Tenant could push an unvalidated spec to the backend.
+func acceptedCurrent(obj v1alpha1.Conditioned) bool {
+	c := meta.FindStatusCondition(obj.GetConditions(), v1alpha1.ConditionAccepted)
+	return c != nil && c.Status == metav1.ConditionTrue && c.ObservedGeneration == obj.GetGeneration()
 }
 
 // backendOptions builds client options, resolving basic auth from a Secret with keys username/password.
@@ -4685,6 +4791,22 @@ func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 `cmd/main.go`: the scaffolded `TenantReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}` block stays; `SetupWithManager` fills `Recorder` and the client constructors default to the real ones.
 
+Now that a Tenant gets a finalizer, the Task 3 CEL test must not leave Tenants pointing at dead URLs. Edit `internal/controller/tenant_api_test.go` `TestTenantCEL`: replace the two literal addresses with a fake server and wait for deletion:
+
+```go
+	srv := fake.New()
+	defer srv.Close()
+	// in the cases table use srv.URL instead of "http://m" and "http://l"
+	...
+			if err == nil {
+				_ = testClient.Delete(testCtx, obj)
+				waitFor(t, func() bool {
+					return errors.IsNotFound(testClient.Get(testCtx, client.ObjectKeyFromObject(obj), &observabilityv1alpha1.Tenant{}))
+				})
+			}
+```
+with imports `"k8s.io/apimachinery/pkg/api/errors"`, `"sigs.k8s.io/controller-runtime/pkg/client"`, `"github.com/antnsn/alerts-operator/internal/backend/fake"`. Build the `cases` slice after `srv` exists.
+
 - [ ] **Step 4: Run tests**
 
 Run: `make manifests && make test`
@@ -4774,9 +4896,12 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 	}
 
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
-	rules := srv.Rules("1")
-	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(rules["alerts-operator/default/sync-l"]) != 1 || len(rules["other/x"]) != 1 {
-		t.Fatalf("rules in backend: %+v", rules)
+	rules, lokiRules := srv.Rules("1"), srv.LokiRules("1")
+	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(lokiRules["alerts-operator/default/sync-l"]) != 1 || len(rules["other/x"]) != 1 {
+		t.Fatalf("rules in backend: mimir=%+v loki=%+v", rules, lokiRules)
+	}
+	if _, leaked := rules["alerts-operator/default/sync-l"]; leaked {
+		t.Fatal("loki group must not be written to mimir")
 	}
 	am := srv.Alertmanager("1")
 	if am == nil || !strings.Contains(am.Config, "receiver: default/keep") || !strings.Contains(am.Config, "- name: default/pushover") || !strings.Contains(am.Config, "user_key: U") {
@@ -4826,7 +4951,7 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 	if err := testClient.Delete(testCtx, lokiG); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { _, ok := srv.Rules("1")["alerts-operator/default/sync-l"]; return !ok })
+	waitFor(t, func() bool { _, ok := srv.LokiRules("1")["alerts-operator/default/sync-l"]; return !ok })
 	if _, ok := srv.Rules("1")["other/x"]; !ok {
 		t.Fatal("foreign namespace was pruned")
 	}
@@ -4931,7 +5056,10 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 		for i := range groups {
 			r.setChildSynced(ctx, &groups[i], err)
 		}
-		return 0, err
+		if backend.IsUnavailable(err) {
+			return 0, err
+		}
+		return 0, nil // 4xx: wait for the next change or resync, no backoff loop
 	}
 
 	nsErr := map[string]error{}
@@ -5026,7 +5154,7 @@ func (r *TenantReconciler) setChildSynced(ctx context.Context, obj v1alpha1.Cond
 		conds := obj.GetConditions()
 		setCondition(&conds, v1alpha1.ConditionSynced, status, reason, msg, obj.GetGeneration())
 		obj.SetConditions(conds)
-	})
+	}, nil) // the early return above already guarantees a real change
 	if err != nil {
 		log.FromContext(ctx).Info("failed to patch Synced on child", "object", obj.GetNamespace()+"/"+obj.GetName(), "err", err.Error())
 	}
@@ -5128,8 +5256,12 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	if err != nil {
 		status, reason, msg := syncedFromErr(err)
 		setTenant(status, reason, msg)
+		setChildren(err)
 		r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "AlertmanagerGetFailed", "%v", err)
-		return err
+		if backend.IsUnavailable(err) {
+			return err
+		}
+		return nil
 	}
 	if current == nil || current.Config != cfg.Config || !maps.Equal(current.TemplateFiles, cfg.TemplateFiles) {
 		if err := store.Set(ctx, cfg); err != nil {
@@ -5206,7 +5338,7 @@ func (r *TenantReconciler) loadTemplates(ctx context.Context, tenant *v1alpha1.T
 - [ ] **Step 5: Run tests**
 
 Run: `make test`
-Expected: PASS. If `TestTenantSyncsRulesAndAlertmanager` flakes on the "no POST on no-op" step because the AlertRuleGroup reconciler re-patches status, confirm the ContactPoint/AlertRuleGroup `patchStatus` calls are skipped when nothing changed (add an early `return` in each child reconciler when `setCondition` reports no change and `ObservedGeneration`/`BackendNamespace` are already current).
+Expected: PASS. The "no POST on no-op" step relies on the child reconcilers and the Tenant reconciler skipping status patches when nothing changed (Tasks 14–18); if it flakes, that guard is what to inspect.
 
 - [ ] **Step 6: Commit**
 
@@ -5301,7 +5433,7 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 		createAndCleanup(t, o)
 	}
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
-	if srv.Alertmanager("1") == nil || len(srv.Rules("1")["alerts-operator/default/fin-g"]) != 1 {
+	if srv.Alertmanager("1") == nil || len(srv.LokiRules("1")["alerts-operator/default/fin-g"]) != 1 {
 		t.Fatal("precondition: backend populated")
 	}
 
@@ -5325,12 +5457,11 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 	if srv.Alertmanager("1") != nil {
 		t.Fatal("alertmanager config not deleted")
 	}
-	rules := srv.Rules("1")
-	if _, ok := rules["alerts-operator/default/fin-g"]; ok {
-		t.Fatal("owned namespace not deleted")
+	if _, ok := srv.LokiRules("1")["alerts-operator/default/fin-g"]; ok {
+		t.Fatal("owned loki namespace not deleted")
 	}
-	if _, ok := rules["other/x"]; !ok {
-		t.Fatal("foreign namespace deleted")
+	if _, ok := srv.Rules("1")["other/x"]; !ok {
+		t.Fatal("foreign mimir namespace deleted")
 	}
 }
 ```
@@ -5505,7 +5636,7 @@ trap 'rm -rf "$OUT"' EXIT
 
 helm lint "$CHART"
 
-helm template x "$CHART" --namespace alerts-operator > "$OUT/default.yaml"
+helm template x "$CHART" --namespace alerts-operator --include-crds > "$OUT/default.yaml"
 crds=$(grep -c '^kind: CustomResourceDefinition$' "$OUT/default.yaml" || true)
 [ "$crds" -eq 4 ] || { echo "expected 4 CRDs, got $crds (run make helm-sync-crds)"; exit 1; }
 grep -q '^kind: Deployment$' "$OUT/default.yaml"
@@ -5516,11 +5647,11 @@ grep -q -- '--metrics-secure=false' "$OUT/default.yaml"
 grep -q 'image: ghcr.io/antnsn/alerts-operator:0.1.0' "$OUT/default.yaml"
 ! grep -q '^kind: ServiceMonitor$' "$OUT/default.yaml"
 
-helm template x "$CHART" --namespace alerts-operator --set serviceMonitor.enabled=true --set image.tag=dev > "$OUT/sm.yaml"
+helm template x "$CHART" --namespace alerts-operator --include-crds --set serviceMonitor.enabled=true --set image.tag=dev > "$OUT/sm.yaml"
 grep -q '^kind: ServiceMonitor$' "$OUT/sm.yaml"
 grep -q 'image: ghcr.io/antnsn/alerts-operator:dev' "$OUT/sm.yaml"
 
-helm template x "$CHART" --namespace alerts-operator --set leaderElection.enabled=false > "$OUT/nole.yaml"
+helm template x "$CHART" --namespace alerts-operator --include-crds --set leaderElection.enabled=false > "$OUT/nole.yaml"
 ! grep -q -- '--leader-elect' "$OUT/nole.yaml"
 ! grep -q '^kind: Role$' "$OUT/nole.yaml"
 
@@ -6516,13 +6647,9 @@ git commit -m "docs: ArgoCD health checks, examples, migration runbook, README"
 
 - [ ] **Step 1: Confirm the Dockerfile is distroless static**
 
-Run: `grep -n '^FROM' Dockerfile`
-Expected:
-```
-FROM golang:1.27 AS builder
-FROM gcr.io/distroless/static:nonroot
-```
-If the second line differs, replace it with `FROM gcr.io/distroless/static:nonroot` and keep `USER 65532:65532`. The build stage already honours `TARGETOS`/`TARGETARCH` build args, so buildx multi-arch works without changes.
+Run: `grep -nE '^(ARG BASE_IMAGE|FROM)' Dockerfile`
+Expected: the builder stage resolves to `golang:1.27` (either `ARG BASE_IMAGE=golang:1.27` + `FROM ${BASE_IMAGE} AS builder`, or a literal `FROM golang:1.27 AS builder`, depending on what kubebuilder scaffolded and Task 1 pinned) and the last `FROM` is `gcr.io/distroless/static:nonroot`.
+If the final stage differs, replace it with `FROM gcr.io/distroless/static:nonroot` and keep `USER 65532:65532`. The build stage honours `TARGETOS`/`TARGETARCH` build args, so buildx multi-arch works without changes.
 
 - [ ] **Step 2: Create the gh-pages branch and enable Pages (one-off)**
 
@@ -6561,7 +6688,16 @@ env:
   IMAGE: ghcr.io/antnsn/alerts-operator
 
 jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a SemVer tag (vX.Y.Z or vX.Y.Z-pre)
+        run: |
+          echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || { echo "tag ${GITHUB_REF_NAME} is not SemVer"; exit 1; }
+
   image:
+    needs: check-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -6590,7 +6726,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   chart:
-    needs: image
+    needs: [check-tag, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -6687,11 +6823,18 @@ deploy-dev: helm-sync-crds ## Build+push :dev for the cluster's node arch(s) and
 		--set image.tag=dev --set image.pullPolicy=Always --wait
 
 .PHONY: undeploy-dev
-undeploy-dev: ## Uninstall the dev release and its CRDs.
+undeploy-dev: ## Uninstall the dev release. CRDs (and every CR) stay; see purge-dev-crds.
 	helm uninstall alerts-operator -n $(DEV_NS) || true
+
+.PHONY: purge-dev-crds
+purge-dev-crds: ## Delete the CRDs — refuses while any Tenant/ContactPoint/NotificationPolicy/AlertRuleGroup exists.
+	@n=$$(kubectl get tenants,contactpoints,notificationpolicies,alertrulegroups -A --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$n" != "0" ]; then echo "refusing: $$n alerts-operator CRs still exist (delete them first so finalizers clean the backends)"; exit 1; fi
 	kubectl delete crd tenants.observability.antnsn.dev contactpoints.observability.antnsn.dev \
 		notificationpolicies.observability.antnsn.dev alertrulegroups.observability.antnsn.dev --ignore-not-found
 ```
+
+The scaffolded `docker-buildx` target prefixes its `buildx build --push` line with `-`, which makes Make ignore a failed build and `deploy-dev` would then install a stale image. Edit that target in the Makefile: remove the leading `-` from the `$(CONTAINER_TOOL) buildx build ...` line only (keep it on the `buildx create` and `buildx rm` lines, which are best-effort cleanup). Verify with `grep -n 'buildx build' Makefile` → line starts with a tab, no `-`.
 
 `DEV_PLATFORMS` defaults from node architectures:
 
@@ -6765,7 +6908,7 @@ Y
 - [ ] `mcurl -H 'X-Scope-OrgID: e2e' $M/api/v1/alerts` → `receiver: e2e/keep`, receivers `e2e/keep`, `e2e/pushover`, `authorization: {credentials: …}` on the webhook.
 - [ ] `mcurl -o /dev/null -w '%{http_code}\n' -H 'X-Scope-OrgID: 1' $M/api/v1/alerts` — same status as before this run (production tenant untouched).
 
-- [ ] Negative: `kubectl -n e2e delete secret pushover` → ContactPoint `pushover` `Accepted=False/SecretNotFound`; Tenant stays `AlertmanagerSynced=True` (compiled without it; check `e2e/pushover` gone from `/api/v1/alerts`). Recreate the secret → back to `True`.
+- [ ] Negative: `kubectl -n e2e delete secret pushover` → ContactPoint `pushover` `Accepted=False/SecretNotFound`. The policy still routes to `pushover`, so the compile fails: NotificationPolicy `Synced=False/Invalid` (message names receiver `pushover`), Tenant `AlertmanagerSynced=False/Invalid`, and the backend keeps the previous document (`mcurl -H 'X-Scope-OrgID: e2e' $M/api/v1/alerts` still lists `e2e/pushover`). Recreate the secret → everything back to `True` within ~5s.
 
 ## 4. Rules
 
@@ -6773,7 +6916,7 @@ Y
 - [ ] `kubectl -n e2e get alertrulegroups` → `Accepted=True Synced=True`; `.status.backendNamespace` = `e2e/e2e/homelab` and `e2e/e2e/udm`.
 - [ ] `mcurl -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules | grep '^e2e/'` → `e2e/e2e/homelab:`.
 - [ ] `mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep '^e2e/'` → `e2e/e2e/udm:`.
-- [ ] Negative: patch bad PromQL: `kubectl -n e2e patch alertrulegroup homelab --type=json -p '[{"op":"replace","path":"/spec/groups/0/rules/0/expr","value":"up{job="}]'` → `Accepted=False/InvalidRule`, message names group `node.health` rule `0`. Revert with the apply above.
+- [ ] Negative: patch bad PromQL: `kubectl -n e2e patch alertrulegroup homelab --type=json -p '[{"op":"replace","path":"/spec/groups/0/rules/0/expr","value":"up{job=\\""}]'` → `Accepted=False/InvalidRule`, message names group `node.health` rule `0`. Revert with the apply above.
 - [ ] Drift repair: `mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$M/prometheus/config/v1/rules/e2e%2Fe2e%2Fhomelab"`; within `resyncInterval` (1m) the namespace is back.
 
 ## 5. Fire a real alert
@@ -6826,15 +6969,15 @@ done
 kubectl patch tenant e2e --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
 ```
 - [ ] `kubectl delete ns e2e`
-- [ ] `make undeploy-dev` (only if not going straight to the production install in docs/migration.md).
+- [ ] `make undeploy-dev` (only if not going straight to the production install in docs/migration.md). `make purge-dev-crds` afterwards only on a cluster with no other alerts-operator CRs.
 
 Record the run date and any deviations in the vault session note.
 ````
 
 - [ ] **Step 3: Verify Makefile**
 
-Run: `make -n deploy-dev | head -3 && make -n undeploy-dev | head -1`
-Expected: shows the `docker-buildx` and `helm upgrade --install` lines, then `helm uninstall`.
+Run: `make -n deploy-dev | head -3 && make -n undeploy-dev | head -1 && make -n purge-dev-crds | head -1`
+Expected: shows the `docker-buildx` and `helm upgrade --install` lines, then `helm uninstall`, then the CR-count guard.
 
 - [ ] **Step 4: README**
 
@@ -6844,7 +6987,8 @@ In `README.md`, replace the `## Development` code block with:
 make test          # envtest + unit tests
 make chart-test    # helm lint + render assertions
 make deploy-dev    # push :dev image and install into the current kube-context (docs/e2e.md)
-make undeploy-dev  # remove the dev release and CRDs
+make undeploy-dev  # remove the dev release (CRDs and CRs stay)
+make purge-dev-crds # delete the CRDs; refuses while any CR exists
 ```
 
 - [ ] **Step 5: Commit**
@@ -6917,7 +7061,7 @@ git tag -a v0.1.0 -m "alerts-operator 0.1.0"
 git push origin v0.1.0
 gh run watch --exit-status
 ```
-Expected: `gh run watch` ends with both jobs `✓ image` and `✓ chart`.
+Expected: `gh run watch` ends with `✓ check-tag`, `✓ image` and `✓ chart`.
 
 - [ ] **Step 5: Verify artifacts**
 
