@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/prometheus/common/model"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -76,6 +77,8 @@ func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
+	msg = truncateMessage(msg)
+
 	changed := false
 	err := patchStatus(ctx, r.Client, &arg, func() {
 		changed = setCondition(&arg.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, arg.Generation)
@@ -84,6 +87,27 @@ func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		arg.Status.BackendNamespace = backendNS
 	}, &changed)
 	return ctrl.Result{}, err
+}
+
+// maxConditionMessage matches metav1.Condition's Message MaxLength (32768), enforced by the
+// generated CRD schema. spec.tenantRef and rule expr/interval/for/keep_firing_for have no
+// MaxLength of their own, so a large invalid value could otherwise produce a message the API
+// server rejects on the status patch -- leaving Accepted never recorded and the object stuck
+// retrying the same failing patch forever.
+const maxConditionMessage = 32768
+
+// truncateMessage bounds msg to fit metav1.Condition's Message field, truncating on a UTF-8
+// rune boundary so the result is always valid.
+func truncateMessage(msg string) string {
+	if len(msg) <= maxConditionMessage {
+		return msg
+	}
+	const suffix = "...(truncated)"
+	cut := maxConditionMessage - len(suffix)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + suffix
 }
 
 // validateRuleGroups checks durations for all backends and PromQL syntax for Mimir.

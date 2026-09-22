@@ -47,6 +47,24 @@ func TestAlertRuleGroupAccepted(t *testing.T) {
 	waitCondition(t, missing, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
 }
 
+// TestAlertRuleGroupOversizedMessageTruncated guards against metav1.Condition's
+// Message MaxLength=32768 (enforced by the generated CRD schema): rule.expr has no MaxLength
+// of its own, and promql's parser echoes the whole offending input back into its error, so an
+// oversized invalid expr would otherwise produce a status patch the API server rejects --
+// leaving Accepted never recorded and the object stuck retrying forever.
+func TestAlertRuleGroupOversizedMessageTruncated(t *testing.T) {
+	newFakeTenant(t, "arg-tenant-oversized", true, false)
+
+	huge := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "arg-oversized", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: "arg-tenant-oversized", Backend: "mimir",
+			Groups: ruleGroups("up{job=" + strings.Repeat("x", maxConditionMessage))}}
+	createAndCleanup(t, huge)
+	waitCondition(t, huge, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalidRule)
+	if c := findCond(huge, observabilityv1alpha1.ConditionAccepted); len(c.Message) > maxConditionMessage {
+		t.Fatalf("condition message length %d exceeds max %d", len(c.Message), maxConditionMessage)
+	}
+}
+
 func findCond(obj observabilityv1alpha1.Conditioned, typ string) metav1.Condition {
 	for _, c := range obj.GetConditions() {
 		if c.Type == typ {
