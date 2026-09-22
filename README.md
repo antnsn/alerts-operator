@@ -66,7 +66,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 |---|---|---|
 | Tenant | `Ready` | All configured targets below are `True`. |
 | Tenant | `AlertmanagerSynced` | Compiled AM config matches backend. `False/NoNotificationPolicy` when no policy exists (backend untouched). |
-| Tenant | `MimirRulesSynced`, `LokiRulesSynced` | Rule namespaces under the prefix match desired state. `False/BackendUnavailable` on 5xx/transport, `False/Rejected` on 4xx. |
+| Tenant | `MimirRulesSynced`, `LokiRulesSynced` | Rule namespaces under the prefix match desired state. `False/BackendUnavailable` on a transport error or `>= 500` from a write; `False/Rejected` on another `4xx` from a write. A `404` is not an error for reads or deletes — an empty tenant (`List`) or an already-gone rule group (`DeleteGroup`/`DeleteNamespace`) is a normal result, not a failure; a bare `404` only reaches `False/Invalid` if a write (`SetGroup`) itself gets one. |
 | children | `Accepted` | References resolve (Tenant, backend, Secrets, ContactPoints), rules parse. Reasons: `TenantNotFound`, `BackendNotConfigured`, `SecretNotFound`, `ContactPointNotFound`, `Conflict`, `InvalidRule`. |
 | children | `Synced` | Included in the last successful backend write. `False/Invalid` names the CR that broke compilation. |
 

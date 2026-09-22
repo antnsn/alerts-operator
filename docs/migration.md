@@ -246,21 +246,75 @@ kubectl -n mimir run prune --rm -it --image=alpine --restart=Never -- \
 
 ```bash
 M=http://mimir-distributed-nginx.mimir:80
-# tenant 1 — Alloy-owned namespaces
-for ns in $(curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep -E '^homelab/' | sed 's/:$//'); do
-  curl -s -X DELETE -H 'X-Scope-OrgID: 1' "$M/prometheus/config/v1/rules/$(printf %s "$ns" | jq -sRr @uri)"
-done
+
+# Deletes $2 (as $1's X-Scope-OrgID) and prints one OK/FAIL line — plain curl prints nothing
+# either way, so a DNS hiccup or backend blip would otherwise look identical to success. 404 is
+# treated as OK (already gone), matching backend.HTTP.Delete's own IsNotFound-is-success rule
+# (internal/backend/httpx.go) — everything else >= 400, or a transport failure, is a real FAIL.
+prune_delete() {
+  org=$1; path=$2; label=$3
+  code=$(curl -s -o /tmp/prune-body -w '%{http_code}' -X DELETE -H "X-Scope-OrgID: $org" "$path")
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL  $label: curl exit $rc (transport error, no HTTP response)"; return 1
+  fi
+  case "$code" in
+    200|202|204|404) echo "OK    $label ($code)" ;;
+    *) echo "FAIL  $label: HTTP $code"; cat /tmp/prune-body; echo; return 1 ;;
+  esac
+}
+
+# tenant 1 — Alloy-owned namespaces. Discovery is a GET, not a DELETE, but its failure mode is
+# the sneakiest one in this script: if it fails, $(...) below yields an empty string, the for
+# loop runs zero times, prints nothing, and looks exactly like "nothing to prune" instead of
+# "couldn't even check" -- every hardcoded delete further down would still print OK, so a reader
+# skimming for FAIL lines would see none and wrongly conclude the whole step succeeded while
+# every Alloy-owned homelab/* namespace stayed live. Check the discovery request's own status
+# before trusting an empty result from it.
+list_code=$(curl -s -o /tmp/homelab-list -w '%{http_code}' -H 'X-Scope-OrgID: 1' "$M/prometheus/config/v1/rules")
+if [ "$list_code" != "200" ]; then
+  echo "FAIL  mimir tenant 1: namespace discovery returned HTTP $list_code, not 200 — aborting this loop, nothing deleted for it"
+  cat /tmp/homelab-list; echo
+else
+  for ns in $(grep -E '^homelab/' /tmp/homelab-list | sed 's/:$//'); do
+    prune_delete 1 "$M/prometheus/config/v1/rules/$(printf %s "$ns" | jq -sRr @uri)" "mimir tenant 1: $ns"
+  done
+fi
 # tenant 1 — Loki direct-sync namespaces
 for ns in loki-homelab loki-udm; do
-  curl -s -X DELETE -H 'X-Scope-OrgID: 1' "http://loki-gateway.loki/loki/api/v1/rules/$ns"
+  prune_delete 1 "http://loki-gateway.loki/loki/api/v1/rules/$ns" "loki tenant 1: $ns"
 done
 # tenant anonymous — mimir-sync leftovers
-curl -s -X DELETE -H 'X-Scope-OrgID: anonymous' $M/prometheus/config/v1/rules/default
+prune_delete anonymous "$M/prometheus/config/v1/rules/default" "mimir tenant anonymous: default"
 # Whole-tenant wipe, see warning above.
-curl -s -X DELETE -H 'X-Scope-OrgID: anonymous' $M/api/v1/alerts
+prune_delete anonymous "$M/api/v1/alerts" "mimir tenant anonymous: alertmanager config"
 ```
 
-Verify: `GET /prometheus/config/v1/rules` for tenant `1` lists only `alerts-operator/*`; for `anonymous` returns 404; Loki lists only `alerts-operator/*`.
+Every line above should print `OK ...`. Any `FAIL ...` line means that specific delete didn't happen
+— re-run just that one (all of these are idempotent) before trusting the Verify step below.
+
+Verify *(cluster command)*:
+
+```bash
+M=http://mimir-distributed-nginx.mimir:80
+kubectl -n mimir run curl --rm -it --image=curlimages/curl --restart=Never -- sh -c "
+  echo 'mimir tenant 1 (expect only alerts-operator/*):'
+  curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep -E '^[A-Za-z]'
+  echo ---
+  echo 'mimir tenant anonymous (expect no rule groups left):'
+  curl -s -i -H 'X-Scope-OrgID: anonymous' $M/prometheus/config/v1/rules
+  echo ---
+  echo 'loki tenant 1 (expect only alerts-operator/*):'
+  curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep -E '^[A-Za-z]'"
+```
+
+Expected: the tenant-`1` mimir output lists only namespaces starting with `alerts-operator/`; the
+loki output lists only namespaces starting with `alerts-operator/`; tenant `anonymous` shows no
+rule-group content either way, but don't expect a `404` for it specifically — on this cluster's
+Mimir, a tenant with zero rule groups returns `200` with an empty `{}` body (verified against a
+synthetic empty tenant), not `404` — `404` is what Loki does for the same situation, a different
+backend with different behavior. If your Mimir version differs and you do see `404`, that's an
+equally valid "nothing left" signal; either way, the content is what matters, not the status code.
 
 ## 7. Prove alerting end to end
 
