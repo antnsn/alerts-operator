@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,6 +43,64 @@ func TestTenantCEL(t *testing.T) {
 	}
 }
 
+// createTenant creates a Tenant and removes it (waiting for the delete to land) at test end.
+func createTenant(t *testing.T, name string, spec observabilityv1alpha1.TenantSpec) *observabilityv1alpha1.Tenant {
+	t.Helper()
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: spec}
+	if err := testClient.Create(testCtx, tn); err != nil {
+		t.Fatalf("create must succeed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = testClient.Delete(testCtx, tn)
+		waitFor(t, func() bool {
+			return errors.IsNotFound(testClient.Get(testCtx, client.ObjectKeyFromObject(tn), &observabilityv1alpha1.Tenant{}))
+		})
+	})
+	return tn
+}
+
+// updateAwaitingVerdict re-reads the Tenant, applies mutate and Updates, retrying while the API
+// server answers with a 409 conflict, and returns the first non-conflict verdict.
+//
+// Without this retry an immutability test does not test immutability (P2-2 of the Task 19 review):
+// the live TenantReconciler in the shared envtest suite adds the finalizer and patches status
+// immediately after Create, so the Update frequently loses the optimistic lock and returns "the
+// object has been modified" -- an error, which satisfies a bare `err == nil { t.Fatal }` assertion
+// whether or not the CEL rule exists. Measured: with the x-kubernetes-validations block deleted
+// from the CRD the old test still passed 2 of 5 runs, and its unset-then-set subtest never reached
+// CEL at all -- it saw the 409 every single time, rule present or absent.
+func updateAwaitingVerdict(t *testing.T, tn *observabilityv1alpha1.Tenant, mutate func(*observabilityv1alpha1.Tenant)) error {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var cur observabilityv1alpha1.Tenant
+		if err := testClient.Get(testCtx, client.ObjectKeyFromObject(tn), &cur); err != nil {
+			t.Fatalf("get before update: %v", err)
+		}
+		mutate(&cur)
+		err := testClient.Update(testCtx, &cur)
+		if !errors.IsConflict(err) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("update never got past an optimistic-lock conflict: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// assertCELRejected asserts the update was rejected by CEL specifically -- an Invalid status error
+// carrying the rule's own message -- rather than by anything that merely happens to be an error.
+func assertCELRejected(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("the update must be rejected with %q, got no error", want)
+	}
+	if !errors.IsInvalid(err) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected an Invalid rejection containing %q, got %T %v", want, err, err)
+	}
+}
+
 // TestTenantRulesNamespacePrefixImmutable guards the CEL fix for a Codex review finding: syncRules
 // only ever prunes backend rule namespaces under the Tenant's *current* prefix (see the ownership
 // comment in tenant_rules.go), so changing spec.rulesNamespacePrefix after creation would silently
@@ -50,30 +110,16 @@ func TestTenantCEL(t *testing.T) {
 func TestTenantRulesNamespacePrefixImmutable(t *testing.T) {
 	srv := fake.New()
 	defer srv.Close()
-
-	create := func(t *testing.T, name string, spec observabilityv1alpha1.TenantSpec) *observabilityv1alpha1.Tenant {
-		t.Helper()
-		tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: spec}
-		if err := testClient.Create(testCtx, tn); err != nil {
-			t.Fatalf("create must succeed: %v", err)
-		}
-		t.Cleanup(func() {
-			_ = testClient.Delete(testCtx, tn)
-			waitFor(t, func() bool {
-				return errors.IsNotFound(testClient.Get(testCtx, client.ObjectKeyFromObject(tn), &observabilityv1alpha1.Tenant{}))
-			})
-		})
-		return tn
-	}
+	const immutableMsg = "rulesNamespacePrefix is immutable"
 
 	t.Run("explicit value cannot change", func(t *testing.T) {
-		tn := create(t, "cel-prefix-explicit", observabilityv1alpha1.TenantSpec{
+		tn := createTenant(t, "cel-prefix-explicit", observabilityv1alpha1.TenantSpec{
 			TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "custom",
 		})
-		tn.Spec.RulesNamespacePrefix = "changed"
-		if err := testClient.Update(testCtx, tn); err == nil {
-			t.Fatal("changing an explicit rulesNamespacePrefix after creation must be rejected")
-		}
+		err := updateAwaitingVerdict(t, tn, func(cur *observabilityv1alpha1.Tenant) {
+			cur.Spec.RulesNamespacePrefix = "changed"
+		})
+		assertCELRejected(t, err, immutableMsg)
 	})
 
 	// The gap this covers: a "self == oldSelf" transition rule alone is not evaluated against a
@@ -83,7 +129,7 @@ func TestTenantRulesNamespacePrefixImmutable(t *testing.T) {
 	// exactly the defect this immutability marker exists to prevent. +kubebuilder:default makes the
 	// field always materialise as "alerts-operator" in the stored object, so oldSelf always exists.
 	t.Run("unset-then-set is rejected, not just set-then-changed", func(t *testing.T) {
-		tn := create(t, "cel-prefix-unset", observabilityv1alpha1.TenantSpec{
+		tn := createTenant(t, "cel-prefix-unset", observabilityv1alpha1.TenantSpec{
 			TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, // RulesNamespacePrefix left unset
 		})
 		if err := testClient.Get(testCtx, client.ObjectKeyFromObject(tn), tn); err != nil {
@@ -92,11 +138,32 @@ func TestTenantRulesNamespacePrefixImmutable(t *testing.T) {
 		if tn.Spec.RulesNamespacePrefix != "alerts-operator" {
 			t.Fatalf("expected the default to be materialised on create, got %q", tn.Spec.RulesNamespacePrefix)
 		}
-		tn.Spec.RulesNamespacePrefix = "foo"
-		if err := testClient.Update(testCtx, tn); err == nil {
-			t.Fatal("setting a previously-unset rulesNamespacePrefix must be rejected")
-		}
+		err := updateAwaitingVerdict(t, tn, func(cur *observabilityv1alpha1.Tenant) {
+			cur.Spec.RulesNamespacePrefix = "foo"
+		})
+		assertCELRejected(t, err, immutableMsg)
 	})
+}
+
+// TestTenantIDImmutable covers P2-1 of the Task 19 review: spec.tenantId has the identical
+// orphaning property as rulesNamespacePrefix, and was still mutable. It is sent as X-Scope-OrgID on
+// every backend call, so editing it from "1" to "2" makes the next reconcile list org 2 (empty),
+// write everything there, and never look at org 1 again -- the org-1 rule namespaces and
+// Alertmanager config stay live and keep firing, unreachable by the prune loop and by Task 20's
+// finalizer, so even deleting the Tenant does not recover them.
+//
+// Unlike rulesNamespacePrefix this needs no +kubebuilder:default to close the unset-then-set hole:
+// tenantId is required with MinLength=1 (confirmed in the generated CRD's `required` list), so it
+// is always present in the stored object and oldSelf always exists.
+func TestTenantIDImmutable(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+
+	tn := createTenant(t, "cel-tenantid", observabilityv1alpha1.TenantSpec{
+		TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "tenantid-test",
+	})
+	err := updateAwaitingVerdict(t, tn, func(cur *observabilityv1alpha1.Tenant) { cur.Spec.TenantID = "2" })
+	assertCELRejected(t, err, "tenantId is immutable")
 }
 
 func TestTenantDefaults(t *testing.T) {

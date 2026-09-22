@@ -58,7 +58,17 @@ type AlertmanagerSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.alertmanager) || has(self.mimir)",message="spec.alertmanager requires spec.mimir"
 type TenantSpec struct {
 	// TenantID is sent as X-Scope-OrgID on every backend request.
+	// Immutable, for the same reason as RulesNamespacePrefix below: tenantId, the backend address
+	// and the prefix are the three coordinates that decide which backend state this Tenant owns,
+	// and the reconciler only ever lists and prunes within the *current* ones. Changing tenantId
+	// leaves every rule namespace and the Alertmanager config live in the old org, where neither
+	// the prune loop nor the finalizer will ever look again -- duplicate, un-pruned rules/alerts
+	// indefinitely, not even recoverable by deleting the Tenant. (The addresses stay mutable:
+	// repointing at a moved gateway is legitimate operations, and the orphaning that can cause is
+	// documented rather than forbidden.) Unlike RulesNamespacePrefix this needs no default marker
+	// to make the transition rule bite -- the field is required, so oldSelf always exists.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tenantId is immutable"
 	TenantID string `json:"tenantId"`
 	// +optional
 	Mimir *BackendSpec `json:"mimir,omitempty"`

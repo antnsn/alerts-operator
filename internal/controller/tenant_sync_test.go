@@ -465,3 +465,138 @@ func TestSyncRulesPreservesDesiredCountOnListFailure(t *testing.T) {
 		t.Fatalf("desired count must be preserved on a List failure, got %d want 2", n)
 	}
 }
+
+// mimirTenantAt builds a Tenant CR pointing at the fake backend, with the given effective rules
+// namespace prefix spelled out or left unset (""), for the ownership-collision tests below.
+func mimirTenantAt(name, addr, prefix string) *observabilityv1alpha1.Tenant {
+	return &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Finalizers: []string{tenantFinalizer}},
+		Spec: observabilityv1alpha1.TenantSpec{
+			TenantID:             "1",
+			Mimir:                &observabilityv1alpha1.BackendSpec{Address: addr},
+			RulesNamespacePrefix: prefix,
+		},
+	}
+}
+
+func mimirGroupFor(tenant, name string) *observabilityv1alpha1.AlertRuleGroup {
+	return &observabilityv1alpha1.AlertRuleGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Generation: 1},
+		Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tenant, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
+		Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+	}
+}
+
+func seedGroup(alert string) []backend.RuleGroup {
+	return []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: alert, Expr: "up == 0"}}}}
+}
+
+// TestTenantDoesNotPruneWhenAnotherTenantSharesOwnership covers P1-1 of the Task 19 review. A
+// backend rule namespace is <prefix>/<k8s-namespace>/<name> and carries no Tenant identity, and
+// store.List is scoped only by X-Scope-OrgID, so two Tenant CRs sharing tenantId + backend address
+// + effective prefix each see the other's namespaces as "under my prefix but not desired" and
+// delete them — alternating forever, with Ready=True on both. The review reproduced exactly this:
+// one Reconcile of team-a emitted
+// DELETE /prometheus/config/v1/rules/alerts-operator%2Fdefault%2Fb-rules.
+//
+// team-b spells the prefix out while team-a leaves it unset: ownership must be compared on the
+// *effective* prefix (Tenant.Prefix()), not the raw field, or the collision is missed for any
+// Tenant stored before +kubebuilder:default materialised the field.
+func TestTenantDoesNotPruneWhenAnotherTenantSharesOwnership(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+	s.SetRules("1", "alerts-operator/default/b-rules", seedGroup("B"))
+
+	teamA := mimirTenantAt("team-a", s.URL, "")
+	teamB := mimirTenantAt("team-b", s.URL, observabilityv1alpha1.DefaultRulesNamespacePrefix)
+	r := &TenantReconciler{
+		Client:   newChildrenFakeClient(t, teamA, teamB, mimirGroupFor("team-a", "a-rules"), mimirGroupFor("team-b", "b-rules")),
+		Recorder: record.NewFakeRecorder(20),
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: teamA.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := s.Rules("1")["alerts-operator/default/b-rules"]; !ok {
+		t.Fatalf("another Tenant's live rule namespace must never be pruned: %+v", s.Rules("1"))
+	}
+	if n := countPrefix(s.Requests(), "DELETE"); n != 0 {
+		t.Fatalf("ambiguous ownership must not delete anything: %v", s.Requests())
+	}
+	// Writes are convergent, deletes are not: only pruning is suppressed.
+	if len(s.Rules("1")["alerts-operator/default/a-rules"]) != 1 {
+		t.Fatalf("own groups must still be written while pruning is skipped: %+v", s.Rules("1"))
+	}
+
+	var got observabilityv1alpha1.Tenant
+	if err := r.Get(context.Background(), clientKey(teamA), &got); err != nil {
+		t.Fatal(err)
+	}
+	c := findCond(&got, observabilityv1alpha1.ConditionMimirRulesSynced)
+	if c.Status != metav1.ConditionFalse || c.Reason != observabilityv1alpha1.ReasonConflict {
+		t.Fatalf("a shared-ownership Tenant must report MimirRulesSynced=False/Conflict, got %+v", c)
+	}
+	if !strings.Contains(c.Message, "team-b") {
+		t.Fatalf("the condition must name the conflicting Tenant: %+v", c)
+	}
+}
+
+// TestTenantPrunesWithoutOwnershipConflict is the control for the test above: with no other Tenant
+// claiming the same (tenantId, address, prefix), an unwanted namespace under our prefix is still
+// pruned exactly as before.
+func TestTenantPrunesWithoutOwnershipConflict(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+	s.SetRules("1", "alerts-operator/default/gone", seedGroup("G"))
+
+	only := mimirTenantAt("only-tenant", s.URL, "")
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, only), Recorder: record.NewFakeRecorder(20)}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: only.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Rules("1")["alerts-operator/default/gone"]; ok {
+		t.Fatalf("an unowned-but-ours namespace must still be pruned when nothing is ambiguous: %+v", s.Rules("1"))
+	}
+	var got observabilityv1alpha1.Tenant
+	if err := r.Get(context.Background(), clientKey(only), &got); err != nil {
+		t.Fatal(err)
+	}
+	if c := findCond(&got, observabilityv1alpha1.ConditionMimirRulesSynced); c.Status != metav1.ConditionTrue {
+		t.Fatalf("no conflict, no error: MimirRulesSynced should be True, got %+v", c)
+	}
+}
+
+// TestTenantOwnershipConflictIsPerBackend: Mimir and Loki are separate targets. Two Tenants sharing
+// a Mimir must not stop either of them pruning its own Loki, which nothing else claims.
+func TestTenantOwnershipConflictIsPerBackend(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+	s.SetRules("1", "alerts-operator/default/stale-mimir", seedGroup("M"))
+	s.SetLokiRules("1", "alerts-operator/default/stale-loki", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "L", Expr: `{job="x"} |= "e"`}}}})
+
+	both := mimirTenantAt("both-backends", s.URL, "")
+	both.Spec.Loki = &observabilityv1alpha1.BackendSpec{Address: s.URL}
+	mimirOnly := mimirTenantAt("mimir-only-peer", s.URL, "") // shares Mimir, claims no Loki
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, both, mimirOnly), Recorder: record.NewFakeRecorder(20)}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: both.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := s.Rules("1")["alerts-operator/default/stale-mimir"]; !ok {
+		t.Fatalf("the contested Mimir namespace must survive: %+v", s.Rules("1"))
+	}
+	if _, ok := s.LokiRules("1")["alerts-operator/default/stale-loki"]; ok {
+		t.Fatalf("a Mimir collision must not block the uncontested Loki prune: %+v", s.LokiRules("1"))
+	}
+	var got observabilityv1alpha1.Tenant
+	if err := r.Get(context.Background(), clientKey(both), &got); err != nil {
+		t.Fatal(err)
+	}
+	if c := findCond(&got, observabilityv1alpha1.ConditionMimirRulesSynced); c.Status != metav1.ConditionFalse || c.Reason != observabilityv1alpha1.ReasonConflict {
+		t.Fatalf("MimirRulesSynced should report the collision, got %+v", c)
+	}
+	if c := findCond(&got, observabilityv1alpha1.ConditionLokiRulesSynced); c.Status != metav1.ConditionTrue {
+		t.Fatalf("LokiRulesSynced must be unaffected by a Mimir collision, got %+v", c)
+	}
+}
