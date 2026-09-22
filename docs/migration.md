@@ -31,13 +31,23 @@ is exactly the kind of thing that stops being true the next time someone re-runs
 # (cluster command)
 M=http://mimir-distributed-nginx.mimir:80
 for org in 1 anonymous; do
+  f="alertmanager-config.$org.$(date +%F).bak.yaml"
   kubectl -n mimir run backup-am-$org --restart=Never --image=curlimages/curl --command -- \
-    curl -s -H "X-Scope-OrgID: $org" "$M/api/v1/alerts"
-  kubectl -n mimir wait --for=jsonpath='{.status.phase}'=Succeeded "pod/backup-am-$org" --timeout=30s
-  kubectl -n mimir logs "backup-am-$org" > "alertmanager-config.$org.$(date +%F).bak.yaml"
+    curl -sS --fail-with-body -H "X-Scope-OrgID: $org" "$M/api/v1/alerts"
+  kubectl -n mimir wait --for=jsonpath='{.status.phase}'=Succeeded "pod/backup-am-$org" --timeout=30s || true
+  kubectl -n mimir logs "backup-am-$org" > "$f" 2>&1
   kubectl -n mimir delete pod "backup-am-$org" --wait=false
+  grep -q '^alertmanager_config:' "$f" \
+    && echo "tenant $org: backup OK ($f)" \
+    || { echo "tenant $org: BACKUP FAILED — do not proceed to step 6 for this tenant until fixed:"; cat "$f"; }
 done
 ```
+
+Plain `curl -s` treats a 401/404/5xx response as success and happily saves the error page as if
+it were the config — `--fail-with-body` makes curl itself fail on those, and the `grep` after it
+is the real check: Mimir returns `alertmanager_config:` as a top-level key even when the value is
+empty (that's what a genuinely-empty tenant looks like), so its absence means the request failed,
+not that the config is empty. Don't run step 6 for a tenant whose backup reports `BACKUP FAILED`.
 
 Store the resulting files somewhere outside the cluster — they contain the Pushover user/token
 and the Keep provider id in plaintext. This exact pattern (`kubectl run` → `wait` → `logs` →
@@ -158,9 +168,23 @@ kubectl get tenant homelab -o jsonpath='{range .status.conditions[*]}{.type}={.s
 Expected: `AlertmanagerSynced=True Synced`, `MimirRulesSynced=True Synced`, `LokiRulesSynced=True Synced`, `Ready=True`.
 
 ```bash
-curl -s -H 'X-Scope-OrgID: 1' $M/api/v1/alerts
+M=http://mimir-distributed-nginx.mimir:80
+kubectl -n mimir run curl --rm -it --image=curlimages/curl --restart=Never -- sh -c \
+  "curl -s -H 'X-Scope-OrgID: 1' $M/api/v1/alerts"
 ```
 Expected: `receivers:` contains `monitoring/keep` and `monitoring/pushover`; `route.receiver: monitoring/keep`.
+
+**Before moving on:** everything above proves Mimir *accepted* the compiled config — it does not
+prove Keep or Pushover actually received anything. Trigger one real test alert now (the same
+technique step 7 formalizes: apply a throwaway always-firing `AlertRuleGroup`, wait for it to
+fire, confirm delivery to both Keep and Pushover, then delete it) and confirm delivery before you
+get anywhere near step 6. Step 6 permanently deletes tenant `anonymous`'s Alertmanager config —
+the one that has actually been delivering Keep/Pushover alerts until now — and `Synced=True` here
+is not evidence that its tenant-`1` replacement works.
+
+(Keep is today's consumer of the generic `webhook` receiver, not something this guide or the
+operator depends on. Retiring Keep later means replacing the `keep` ContactPoint's URL and secret
+with the new receiver's — no operator or CRD change.)
 
 ## 4. Rules
 
@@ -174,8 +198,10 @@ Verify *(cluster command)*:
 
 ```bash
 kubectl get alertrulegroups -n monitoring
-curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep '^alerts-operator/'
-curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator/'
+M=http://mimir-distributed-nginx.mimir:80
+kubectl -n mimir run curl --rm -it --image=curlimages/curl --restart=Never -- sh -c "
+  curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep '^alerts-operator/'; echo ---;
+  curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator/'"
 ```
 Expected: `Accepted=True Synced=True` for all; namespaces `alerts-operator/monitoring/homelab`, `alerts-operator/monitoring/loki-homelab`, `alerts-operator/monitoring/loki-udm`.
 
@@ -195,6 +221,12 @@ At this point Mimir has the rules twice (Alloy `homelab/*` and operator `alerts-
 Verify: `kubectl get ns mimir-sync` → NotFound; Alloy pod restarted and logs show no `mimir.rules.kubernetes` component.
 
 ## 6. Prune old backend state (manual, once)
+
+**Do not start this step until you've confirmed real alert delivery on tenant `1`'s Keep/Pushover
+routing** — the smoke test called out at the end of step 3, or step 7 done early. `Synced=True`
+in step 3 is not that proof. This step deletes tenant `anonymous`'s Alertmanager config, which is
+what has actually been delivering alerts until now; the only way back after this step is restoring
+your "Before you begin" backup by hand.
 
 Alloy's prefix and mimir-sync's namespaces are outside `alerts-operator/`, so the operator never touches them.
 
