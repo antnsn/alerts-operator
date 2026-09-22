@@ -60,7 +60,7 @@ type TenantReconciler struct {
 	NewMimir func(backend.Options) MimirClient
 	NewLoki  func(backend.Options) backend.RuleStore
 
-	mu         sync.Mutex //nolint:unused // guards lastAMSync; taken into use by Task 19's syncAlertmanager
+	mu         sync.Mutex // guards lastAMSync, read/written from syncAlertmanager
 	lastAMSync map[string]time.Time
 }
 
@@ -186,6 +186,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if pending {
 		if prev := meta.FindStatusCondition(base.Status.Conditions, v1alpha1.ConditionReady); prev != nil {
 			readyStatus, readyReason, readyMsg = prev.Status, prev.Reason, prev.Message
+		} else {
+			// First reconcile ever for this Tenant: there is no prior Ready value to preserve.
+			// Defaulting to True here would claim readiness this pass never established (some
+			// target condition is still Pending); report Unknown/Pending instead, matching the
+			// pending target's own status rather than asserting a value we don't have grounds for.
+			readyStatus, readyReason, readyMsg = metav1.ConditionUnknown, v1alpha1.ReasonPending, "waiting for child validation"
 		}
 	}
 	setCondition(&tenant.Status.Conditions, v1alpha1.ConditionReady, readyStatus, readyReason, readyMsg, gen)
@@ -331,25 +337,7 @@ func (r *TenantReconciler) lokiClient(ctx context.Context, tenant *v1alpha1.Tena
 	return loki.New(o), nil
 }
 
-// --- stubs replaced in Tasks 19 and 20 ---
-
-// syncRules is a stub: Task 19 fills in the real Mimir/Loki rule sync. It sets the backend's
-// RulesSynced condition to True and reports the desired group count.
-func (r *TenantReconciler) syncRules(_ context.Context, tenant *v1alpha1.Tenant, _ backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, _ map[string]bool) (int32, error) {
-	typ := v1alpha1.ConditionMimirRulesSynced
-	if be == v1alpha1.BackendLoki {
-		typ = v1alpha1.ConditionLokiRulesSynced
-	}
-	setCondition(&tenant.Status.Conditions, typ, metav1.ConditionTrue, v1alpha1.ReasonSynced, "", tenant.Generation)
-	return int32(len(groups)), nil
-}
-
-// syncAlertmanager is a stub: Task 19 fills in the real Alertmanager config sync. It sets
-// AlertmanagerSynced to True.
-func (r *TenantReconciler) syncAlertmanager(_ context.Context, tenant *v1alpha1.Tenant, _ backend.AlertmanagerStore, _ *children) error {
-	setCondition(&tenant.Status.Conditions, v1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, v1alpha1.ReasonSynced, "", tenant.Generation)
-	return nil
-}
+// --- stub replaced in Task 20 ---
 
 // finalize is a stub: Task 20 fills in the real backend cleanup (deleting the tenant's rule
 // groups and Alertmanager config).

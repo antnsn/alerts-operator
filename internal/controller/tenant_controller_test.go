@@ -8,15 +8,77 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/backend"
 	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
 )
+
+// stubMimirClient is a no-op MimirClient: List reports no rules, everything else is unreachable in
+// the tests that use it (a stale-generation child defers the Alertmanager write before any backend
+// call, and no AlertRuleGroup is seeded). It exists purely to let Reconcile run to completion
+// without a real Mimir behind it, for tests about status aggregation rather than backend I/O.
+type stubMimirClient struct{}
+
+func (stubMimirClient) List(context.Context) (map[string][]backend.RuleGroup, error) {
+	return map[string][]backend.RuleGroup{}, nil
+}
+func (stubMimirClient) SetGroup(context.Context, string, backend.RuleGroup) error { return nil }
+func (stubMimirClient) DeleteGroup(context.Context, string, string) error         { return nil }
+func (stubMimirClient) DeleteNamespace(context.Context, string) error             { return nil }
+func (stubMimirClient) Get(context.Context) (*backend.AlertmanagerConfig, error)  { return nil, nil }
+func (stubMimirClient) Set(context.Context, *backend.AlertmanagerConfig) error    { return nil }
+func (stubMimirClient) Delete(context.Context) error                              { return nil }
+
+// TestTenantReadyOnFirstReconcileFallsBackToPending covers the P3-1 finding carried from the Task 18
+// review: Ready's aggregation preserves a pending target's PRIOR Ready value when some condition is
+// Unknown/Pending (see the "pending" block in Reconcile) -- but a Tenant's very first reconcile has
+// no prior Ready condition to fall back to. Left unhandled, Go's zero-value default for the local
+// (True/Synced) would silently report readiness this pass never established. It must report
+// Unknown/Pending instead -- the same "we don't know yet" the pending target itself is reporting.
+//
+// Built on the isolated newChildrenFakeClient fixture (see TestTenantKeepsStaleGenerationNamespace):
+// this is about Reconcile's in-memory aggregation, not backend I/O, and a stale-generation child
+// created via the live envtest suite would race its own reconciler re-validating it away almost
+// immediately, the same problem that test ran into.
+func TestTenantReadyOnFirstReconcileFallsBackToPending(t *testing.T) {
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tn-first-pending", Finalizers: []string{tenantFinalizer}},
+		Spec:       observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: "http://stub"}},
+	}
+	// Stale-generation ContactPoint: listChildren sets PendingAM, so syncAlertmanager reports
+	// AlertmanagerSynced=Unknown/Pending without ever touching a backend.
+	staleCP := &observabilityv1alpha1.ContactPoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "stale-cp", Namespace: "default", Generation: 2},
+		Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
+		Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
+	}
+
+	r := &TenantReconciler{
+		Client:   newChildrenFakeClient(t, tn, staleCP),
+		Recorder: record.NewFakeRecorder(20),
+		NewMimir: func(backend.Options) MimirClient { return stubMimirClient{} },
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tn.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got observabilityv1alpha1.Tenant
+	if err := r.Get(context.Background(), types.NamespacedName{Name: tn.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if ready := findCond(&got, observabilityv1alpha1.ConditionReady); ready.Status != metav1.ConditionUnknown || ready.Reason != observabilityv1alpha1.ReasonPending {
+		t.Fatalf("first reconcile with a pending child must report Ready=Unknown/Pending (no prior value to fall back to), got %+v", ready)
+	}
+}
 
 func TestTenantReadyWithoutChildren(t *testing.T) {
 	// Loki-only: no Alertmanager, so Ready does not depend on a NotificationPolicy.
@@ -90,10 +152,18 @@ func acceptedAt(gen int64) []metav1.Condition {
 // a transient "stale generation" window would be reconciled away asynchronously and is not
 // deterministically observable. Seeding a fake client with the desired generation/condition
 // combination directly tests listChildren's classification without that race.
+//
+// WithStatusSubresource is required for every Conditioned kind: without it, the fake client's
+// Status() sub-writer fails every Get/Patch/Update with a bare "<kind> not found", even though the
+// object is right there — the fake client keeps status subresource state in a separate store that
+// only exists for types registered this way (confirmed by hand: TestTenantKeepsStaleGenerationNamespace
+// needs this to drive r.Reconcile, which patches Tenant/AlertRuleGroup status, against this fixture).
 func newChildrenFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
+		WithStatusSubresource(&observabilityv1alpha1.Tenant{}, &observabilityv1alpha1.ContactPoint{},
+			&observabilityv1alpha1.NotificationPolicy{}, &observabilityv1alpha1.AlertRuleGroup{}).
 		WithIndex(&observabilityv1alpha1.ContactPoint{}, index.IndexTenantRef, func(o client.Object) []string {
 			return []string{o.(*observabilityv1alpha1.ContactPoint).Spec.TenantRef}
 		}).
