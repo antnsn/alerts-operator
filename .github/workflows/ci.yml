@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with: { version: v2.13.2 }
       - run: make test
       - uses: azure/setup-helm@v5
