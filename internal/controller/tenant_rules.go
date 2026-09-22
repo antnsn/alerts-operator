@@ -55,8 +55,15 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	}
 
 	nsErr := map[string]error{}
+	// kept tracks whether this pass actually excluded a namespace present in the backend because of
+	// keep (as opposed to keep simply containing no-op entries for the *other* backend's namespaces
+	// -- keep is shared across both syncRules calls in one Reconcile, and desired never contains a
+	// kept namespace at all, see the diff loop below, so only the prune loop's `range actual` can
+	// ever observe a real hit for this backend).
+	var kept bool
 	for ns, want := range desired {
 		if keep[ns] {
+			kept = true
 			continue
 		}
 		have := actual[ns]
@@ -90,16 +97,18 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 			}
 		}
 	}
-	// Note: if spec.rulesNamespacePrefix changes, namespaces under the OLD prefix fall outside both
-	// `desired` and this HasPrefix check and so are never pruned -- deliberately: this loop only
-	// ever touches what it can positively confirm it owns under the tenant's *current* prefix, per
-	// the ownership rule above. Reclaiming the old prefix's namespaces would require trusting that a
-	// prefix change is a same-tenant rename rather than, say, a deliberate handoff/abandonment, which
-	// this reconciler has no way to distinguish -- getting that wrong means deleting rules someone
-	// else now owns. Treated as a known limitation of a rare, deliberate admin action, not fixed here.
+	// This loop only ever touches what it can positively confirm it owns under the tenant's
+	// *current* prefix. spec.rulesNamespacePrefix is CEL-immutable (api/v1alpha1/tenant_types.go)
+	// precisely so that "current prefix" is also the only prefix this Tenant has ever used: were the
+	// field mutable, namespaces under an OLD prefix would fall outside both `desired` and this
+	// HasPrefix check and so would never be pruned, silently orphaning them (duplicate, un-pruned
+	// rules/alerts indefinitely) -- and blindly reclaiming an old prefix on a rename would risk
+	// deleting rules that now belong to a different tenant/purpose, which this reconciler has no way
+	// to distinguish from a same-tenant rename.
 	var pruneErrs []error
 	for ns := range actual {
 		if keep[ns] {
+			kept = true
 			continue
 		}
 		if _, wanted := desired[ns]; strings.HasPrefix(ns, prefix) && !wanted {
@@ -121,6 +130,15 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	all = append(all, pruneErrs...)
 	worst := worstErr(all)
 	status, reason, msg := syncedFromErr(worst)
+	if worst == nil && kept {
+		// A stale-generation AlertRuleGroup's namespace exists in the backend and was excluded from
+		// this pass's diff/prune (see keep's doc comment): we genuinely don't know whether it matches
+		// its just-edited spec yet. Reporting True here would claim completeness this pass never
+		// established for that namespace -- report the same Unknown/Pending signal syncAlertmanager
+		// uses for its own stale-generation case (PendingAM), which Ready's aggregation already knows
+		// how to handle (preserve the prior Ready value rather than jumping to True).
+		status, reason, msg = metav1.ConditionUnknown, v1alpha1.ReasonPending, "waiting for child validation"
+	}
 	setCondition(&tenant.Status.Conditions, condType, status, reason, msg, tenant.Generation)
 	if worst != nil && backend.IsUnavailable(worst) {
 		return desiredCount, worst

@@ -191,6 +191,15 @@ func TestTenantKeepsStaleGenerationNamespace(t *testing.T) {
 	if n := countPrefix(s.Requests(), "DELETE"); n != 0 {
 		t.Fatalf("no DELETE expected for a stale-generation namespace: %v", s.Requests())
 	}
+	// MimirRulesSynced must not claim completeness this pass never established: the excluded
+	// namespace's content might not match its just-edited spec yet, so True/Synced would be a lie.
+	var afterTn observabilityv1alpha1.Tenant
+	if err := r.Get(context.Background(), clientKey(tn), &afterTn); err != nil {
+		t.Fatal(err)
+	}
+	if c := findCond(&afterTn, observabilityv1alpha1.ConditionMimirRulesSynced); c.Status != metav1.ConditionUnknown || c.Reason != observabilityv1alpha1.ReasonPending {
+		t.Fatalf("MimirRulesSynced must report Unknown/Pending while a stale-generation namespace is excluded from this pass, got %+v", c)
+	}
 
 	// The child "reconciles" (Accepted catches up to newGen); the Tenant reconciler must then push
 	// the content it was withholding.
