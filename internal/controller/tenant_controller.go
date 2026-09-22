@@ -61,7 +61,7 @@ type TenantReconciler struct {
 	NewLoki  func(backend.Options) backend.RuleStore
 
 	mu         sync.Mutex // guards lastAMSync, read/written from syncAlertmanager
-	lastAMSync map[string]time.Time
+	lastAMSync map[string]amSyncState
 }
 
 // children are the Accepted CRs referencing one Tenant, plus what's known about children that are
@@ -401,7 +401,7 @@ func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// (k8s.io/client-go/tools/record), so this is the correct constructor for it.
 		r.Recorder = mgr.GetEventRecorderFor("tenant-controller") //nolint:staticcheck // record.EventRecorder is the field type
 	}
-	r.lastAMSync = map[string]time.Time{}
+	r.lastAMSync = map[string]amSyncState{}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Tenant{}).
 		Watches(&v1alpha1.ContactPoint{}, handler.EnqueueRequestsFromMapFunc(mapToTenant)).

@@ -81,6 +81,13 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 			}
 		}
 	}
+	// Note: if spec.rulesNamespacePrefix changes, namespaces under the OLD prefix fall outside both
+	// `desired` and this HasPrefix check and so are never pruned -- deliberately: this loop only
+	// ever touches what it can positively confirm it owns under the tenant's *current* prefix, per
+	// the ownership rule above. Reclaiming the old prefix's namespaces would require trusting that a
+	// prefix change is a same-tenant rename rather than, say, a deliberate handoff/abandonment, which
+	// this reconciler has no way to distinguish -- getting that wrong means deleting rules someone
+	// else now owns. Treated as a known limitation of a rare, deliberate admin action, not fixed here.
 	var pruneErrs []error
 	for ns := range actual {
 		if keep[ns] {
@@ -129,12 +136,25 @@ func worstErr(errs []error) error {
 	return first
 }
 
-// setChildSynced patches Synced on a child. Patch failures are logged, not returned: the next
-// Tenant reconcile repeats the patch.
+// setChildSynced patches Synced on a child from a backend sync error, classified via syncedFromErr
+// (built for backend/transport errors — see IsUnavailable's "anything that isn't a *StatusError
+// counts as unavailable" default). Patch failures are logged, not returned: the next Tenant
+// reconcile repeats the patch.
 func (r *TenantReconciler) setChildSynced(ctx context.Context, obj v1alpha1.Conditioned, syncErr error) {
 	status, reason, msg := syncedFromErr(syncErr)
+	r.setChildStatus(ctx, obj, status, reason, msg)
+}
+
+// setChildStatus patches Synced on a child to an explicit status/reason/message. Patch failures are
+// logged, not returned: the next Tenant reconcile repeats the patch.
+//
+// The dedup check compares ObservedGeneration in addition to status/reason/message: without that, a
+// child edited to new content that happens to sync to the same outcome as before (e.g. True/Synced/""
+// both times) would skip the patch and never get its Synced condition's ObservedGeneration bumped to
+// the new generation, leaving it permanently stale even though the object really was re-verified.
+func (r *TenantReconciler) setChildStatus(ctx context.Context, obj v1alpha1.Conditioned, status metav1.ConditionStatus, reason, msg string) {
 	conds := obj.GetConditions()
-	if c := findCondition(conds, v1alpha1.ConditionSynced); c != nil && c.Status == status && c.Reason == reason && c.Message == msg {
+	if c := findCondition(conds, v1alpha1.ConditionSynced); c != nil && c.Status == status && c.Reason == reason && c.Message == msg && c.ObservedGeneration == obj.GetGeneration() {
 		return
 	}
 	err := patchStatus(ctx, r.Client, obj, func() {

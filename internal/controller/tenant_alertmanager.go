@@ -61,15 +61,20 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	if err != nil {
 		var ae *compile.AttributedError
 		if errors.As(err, &ae) {
+			// Explicit False/Invalid here, not setChildSynced(..., ae.Err): ae.Err is a compile/
+			// validation failure, never a backend error, so it must not go through syncedFromErr
+			// (built for backend/transport errors -- IsUnavailable treats anything that isn't a
+			// *backend.StatusError as unavailable, which would misreport a bad webhook URL as
+			// BackendUnavailable instead of Invalid).
 			for i := range ch.ContactPoints {
 				cp := &ch.ContactPoints[i]
 				if ae.Kind == "ContactPoint" && cp.Namespace == ae.Namespace && cp.Name == ae.Name {
-					r.setChildSynced(ctx, cp, ae.Err)
+					r.setChildStatus(ctx, cp, metav1.ConditionFalse, v1alpha1.ReasonInvalid, ae.Err.Error())
 					r.Recorder.Eventf(cp, corev1.EventTypeWarning, "CompileFailed", "%v", ae.Err)
 				}
 			}
 			if ae.Kind == "NotificationPolicy" {
-				r.setChildSynced(ctx, ch.Policy, ae.Err)
+				r.setChildStatus(ctx, ch.Policy, metav1.ConditionFalse, v1alpha1.ReasonInvalid, ae.Err.Error())
 				r.Recorder.Eventf(ch.Policy, corev1.EventTypeWarning, "CompileFailed", "%v", ae.Err)
 			}
 		}
@@ -78,7 +83,11 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	}
 
 	hash := compile.HashAlertmanager(cfg)
-	if hash == tenant.Status.AlertmanagerConfigHash && time.Since(r.lastSync(tenant.Name)) < tenant.Resync() {
+	// Keyed on gen too, not just hash+recency: a Tenant whose Policy/ContactPoints are unchanged
+	// (same hash) but whose spec.mimir.address or spec.tenantId just changed would otherwise report
+	// Synced from a cache entry that verified a *different* backend/tenant, skipping any real check
+	// against the new one until the resync interval next elapses.
+	if last := r.lastSync(tenant.Name); hash == tenant.Status.AlertmanagerConfigHash && last.gen == gen && time.Since(last.at) < tenant.Resync() {
 		setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 		setChildren(nil)
 		return nil
@@ -108,25 +117,34 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 		}
 	}
 	tenant.Status.AlertmanagerConfigHash = hash
-	r.markSynced(tenant.Name)
+	r.markSynced(tenant.Name, gen)
 	setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 	setChildren(nil)
 	return nil
 }
 
-func (r *TenantReconciler) lastSync(name string) time.Time {
+// amSyncState records when, and at what Tenant generation, syncAlertmanager last confirmed the
+// backend actually holds the compiled config -- the gen is what lets the hash+recency skip above
+// notice a backend/tenant identity change (spec.mimir.address, spec.tenantId) even when the compiled
+// document's content, and therefore its hash, hasn't changed.
+type amSyncState struct {
+	at  time.Time
+	gen int64
+}
+
+func (r *TenantReconciler) lastSync(name string) amSyncState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.lastAMSync[name]
 }
 
-func (r *TenantReconciler) markSynced(name string) {
+func (r *TenantReconciler) markSynced(name string, gen int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.lastAMSync == nil {
-		r.lastAMSync = map[string]time.Time{}
+		r.lastAMSync = map[string]amSyncState{}
 	}
-	r.lastAMSync[name] = time.Now()
+	r.lastAMSync[name] = amSyncState{at: time.Now(), gen: gen}
 }
 
 // secretResolver reads Secret keys through the cached client.

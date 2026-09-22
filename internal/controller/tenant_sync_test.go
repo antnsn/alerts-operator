@@ -16,6 +16,7 @@ import (
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 	fakebackend "github.com/antnsn/alerts-operator/internal/backend/fake"
+	"github.com/antnsn/alerts-operator/internal/backend/mimir"
 )
 
 func countPrefix(reqs []string, prefix string) int {
@@ -243,4 +244,122 @@ func TestTenantAlertmanagerRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+}
+
+// TestTenantAlertmanagerCompileErrorClassifiedAsInvalid covers a Codex review finding on this task:
+// a compile.AttributedError (a validation failure, e.g. a malformed webhook URL that passes CRD
+// validation but fails Alertmanager's own config loader) must set the offending child's Synced
+// condition to False/Invalid directly, not go through setChildSynced/syncedFromErr -- that
+// classifier is built for backend/transport errors, and IsUnavailable's fallback ("anything that
+// isn't a *backend.StatusError counts as unavailable") would otherwise misreport a content problem
+// as a transient backend outage.
+func TestTenantAlertmanagerCompileErrorClassifiedAsInvalid(t *testing.T) {
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tn-compile-err", Finalizers: []string{tenantFinalizer}},
+		Spec:       observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: "http://stub"}},
+	}
+	badCP := &observabilityv1alpha1.ContactPoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad-hook", Namespace: "default", Generation: 1},
+		Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "not-a-url"}}},
+		Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
+	}
+	pol := &observabilityv1alpha1.NotificationPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "pol", Namespace: "default", Generation: 1},
+		Spec:       observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "bad-hook"}},
+		Status:     observabilityv1alpha1.NotificationPolicyStatus{Conditions: acceptedAt(1)},
+	}
+
+	r := &TenantReconciler{
+		Client:   newChildrenFakeClient(t, tn, badCP, pol),
+		Recorder: record.NewFakeRecorder(20),
+		NewMimir: func(backend.Options) MimirClient { return stubMimirClient{} },
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tn.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got observabilityv1alpha1.ContactPoint
+	if err := r.Get(context.Background(), clientKey(badCP), &got); err != nil {
+		t.Fatal(err)
+	}
+	if c := findCond(&got, observabilityv1alpha1.ConditionSynced); c.Status != metav1.ConditionFalse || c.Reason != observabilityv1alpha1.ReasonInvalid {
+		t.Fatalf("compile/validation failure on a ContactPoint must be Synced=False/Invalid, got %+v", c)
+	}
+}
+
+// TestTenantAlertmanagerRechecksBackendAfterGenerationChange covers a second Codex review finding:
+// the hash+recency skip in syncAlertmanager must not treat a Tenant generation change (e.g.
+// spec.mimir.address or spec.tenantId edited to point at a different backend/tenant) as a no-op just
+// because the compiled Policy/ContactPoints document happens to hash the same as before -- that would
+// report Synced without ever having verified the (possibly different) backend actually holds it.
+func TestTenantAlertmanagerRechecksBackendAfterGenerationChange(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tn-am-regen", Generation: 1},
+		Spec:       observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: s.URL}},
+	}
+	keepCP := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "keep", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://keep"}}}}
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "pol", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "keep"}}}
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, keepCP, pol), Recorder: record.NewFakeRecorder(20)}
+	var freshCP observabilityv1alpha1.ContactPoint
+	if err := r.Get(context.Background(), clientKey(keepCP), &freshCP); err != nil {
+		t.Fatal(err)
+	}
+	var freshPol observabilityv1alpha1.NotificationPolicy
+	if err := r.Get(context.Background(), clientKey(pol), &freshPol); err != nil {
+		t.Fatal(err)
+	}
+	ch := &children{Policy: &freshPol, ContactPoints: []observabilityv1alpha1.ContactPoint{freshCP}}
+	mc := mimir.New(backend.Options{Address: s.URL, TenantID: "1"})
+
+	if err := r.syncAlertmanager(context.Background(), tn, mc, ch); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPrefix(s.Requests(), "GET /api/v1/alerts"); n != 1 {
+		t.Fatalf("expected one AM GET on the first sync, got %d: %v", n, s.Requests())
+	}
+
+	// Same Policy/ContactPoints (same compiled hash) but a new generation, as if spec.mimir.address
+	// or spec.tenantId had just changed.
+	tn.Generation = 2
+	s.ResetRequests()
+	if err := r.syncAlertmanager(context.Background(), tn, mc, ch); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPrefix(s.Requests(), "GET /api/v1/alerts"); n != 1 {
+		t.Fatalf("a generation change must force a real backend check even when the compiled hash is unchanged, got %d GETs: %v", n, s.Requests())
+	}
+}
+
+// TestSetChildSyncedRefreshesObservedGenerationOnRepeatOutcome covers a third Codex review finding:
+// setChildSynced's dedup short-circuit compared only status/reason/message, so a child re-validated
+// at a new generation whose outcome happens to match the previous one (e.g. True/Synced/"" both
+// times) would never get Synced.ObservedGeneration bumped, leaving it permanently stale even though
+// the object really was re-checked at its current generation.
+func TestSetChildSyncedRefreshesObservedGenerationOnRepeatOutcome(t *testing.T) {
+	cp := &observabilityv1alpha1.ContactPoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: "default", Generation: 2},
+		Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: "t", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
+		// Same outcome setChildSynced(nil) below will compute (True/Synced/""), but observed at the
+		// PRE-edit generation: the object's current generation (2) has moved past it.
+		Status: observabilityv1alpha1.ContactPointStatus{Conditions: []metav1.Condition{
+			{Type: observabilityv1alpha1.ConditionSynced, Status: metav1.ConditionTrue, Reason: observabilityv1alpha1.ReasonSynced, ObservedGeneration: 1},
+		}},
+	}
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, cp)}
+
+	r.setChildSynced(context.Background(), cp, nil)
+
+	var after observabilityv1alpha1.ContactPoint
+	if err := r.Get(context.Background(), clientKey(cp), &after); err != nil {
+		t.Fatal(err)
+	}
+	if c := findCond(&after, observabilityv1alpha1.ConditionSynced); c.ObservedGeneration != 2 {
+		t.Fatalf("Synced.ObservedGeneration must track the object's current generation even when the outcome is unchanged, got %+v", c)
+	}
 }
