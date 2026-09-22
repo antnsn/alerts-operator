@@ -111,15 +111,29 @@ func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alph
 }
 
 // routeDepth returns the depth of the route tree; a single root is 1. It decodes children via
-// ChildRoutes() and returns the first decode error, which the caller treats as Invalid.
+// ChildRoutes() and returns the first decode error, which the caller treats as Invalid. Descent
+// stops once the tree is already deeper than maxRouteDepth, so a maliciously deep (or wide-and-deep)
+// route tree can't force unbounded recursive JSON decoding before validate's depth check runs --
+// each level's ChildRoutes() call parses the remaining subtree, so unmarshaling every level of an
+// attacker-sized tree would otherwise cost roughly O(depth^2).
 func routeDepth(r *v1alpha1.Route) (int, error) {
+	return routeDepthCapped(r, maxRouteDepth+1)
+}
+
+// routeDepthCapped mirrors routeDepth but refuses to decode more than budget further levels: once
+// budget is exhausted it returns 1 without calling ChildRoutes(), so the caller sees a depth
+// beyond maxRouteDepth (guaranteeing validate rejects it) without paying for the rest of the tree.
+func routeDepthCapped(r *v1alpha1.Route, budget int) (int, error) {
+	if budget <= 0 {
+		return 1, nil
+	}
 	children, err := r.ChildRoutes()
 	if err != nil {
 		return 0, err
 	}
 	maxDepth := 0
 	for i := range children {
-		d, err := routeDepth(&children[i])
+		d, err := routeDepthCapped(&children[i], budget-1)
 		if err != nil {
 			return 0, err
 		}

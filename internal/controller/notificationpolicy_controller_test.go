@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,36 @@ func TestRouteDepthAndWinner(t *testing.T) {
 	}
 	if policyWinner(nil) != nil {
 		t.Fatal("empty → nil")
+	}
+}
+
+// nestedRouteJSON builds a Route JSON blob that nests depth levels deep (a single child chain),
+// root counted as depth 1.
+func nestedRouteJSON(depth int) []byte {
+	if depth <= 1 {
+		return []byte(`{"receiver":"leaf"}`)
+	}
+	return []byte(fmt.Sprintf(`{"receiver":"r","routes":[%s]}`, nestedRouteJSON(depth-1)))
+}
+
+// TestRouteDepthCappedForDeepTree guards against the recursion in routeDepth fully decoding an
+// attacker-sized route tree before validate ever gets to compare it against maxRouteDepth (see
+// Codex review finding on notificationpolicy_controller.go). A route tree far deeper than
+// maxRouteDepth must report a depth beyond the limit without walking (and re-decoding) the whole
+// tree: if the cap weren't applied, the returned depth would equal realDepth instead of being
+// capped near maxRouteDepth.
+func TestRouteDepthCappedForDeepTree(t *testing.T) {
+	const realDepth = 500
+	var root observabilityv1alpha1.Route
+	if err := json.Unmarshal(nestedRouteJSON(realDepth), &root); err != nil {
+		t.Fatal(err)
+	}
+	d, err := routeDepth(&root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := maxRouteDepth + 2; d != want {
+		t.Fatalf("expected capped depth %d (not the real depth %d), got %d", want, realDepth, d)
 	}
 }
 
