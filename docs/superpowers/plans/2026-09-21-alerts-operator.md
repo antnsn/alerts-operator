@@ -7025,7 +7025,7 @@ git commit -m "docs: ArgoCD health checks, examples, migration runbook, README"
 
 **Interfaces:**
 - Consumes: `make helm-sync-crds` (Task 21); chart at `charts/alerts-operator`; kubebuilder `Dockerfile`.
-- Produces: on tag `v*`: image `ghcr.io/antnsn/alerts-operator:<version-without-v>` + `:latest` (linux/amd64, linux/arm64); chart `alerts-operator-<version>.tgz` on `https://antnsn.github.io/alerts-operator` (gh-pages `index.yaml`).
+- Produces: on tag `v*`: image `ghcr.io/antnsn/alerts-operator:<version-without-v>` + `:latest` (linux/amd64, linux/arm64); chart `alerts-operator-<version>.tgz` on `https://antnsn.github.io/alerts-operator` (gh-pages `index.yaml`). On push to `main`: image `ghcr.io/antnsn/alerts-operator:dev` + `:sha-<short-sha>` (linux/amd64), pushed by the `dev-image` job using the workflow's own `GITHUB_TOKEN` — no local build, no PAT.
 
 - [ ] **Step 1: Confirm the Dockerfile is distroless static**
 
@@ -7061,6 +7061,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
@@ -7071,6 +7072,7 @@ env:
 
 jobs:
   check-tag:
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Require a SemVer tag (vX.Y.Z or vX.Y.Z-pre)
@@ -7136,11 +7138,38 @@ jobs:
           skip_existing: true
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dev-image:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: sha
+        name: Short SHA
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:dev
+            ${{ env.IMAGE }}:sha-${{ steps.sha.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 ```
 
 Notes for the reader:
 - `docker/metadata-action` with `type=semver,pattern={{version}}` strips the `v`: tag `v0.1.0` → image `ghcr.io/antnsn/alerts-operator:0.1.0`. That equals the chart's `appVersion` (`0.1.0`), which is the chart's default image tag, so the packaged chart resolves to an existing image with no `values.yaml` rewrite.
 - chart-releaser creates a GitHub Release `alerts-operator-<version>` with the `.tgz` and updates `index.yaml` on `gh-pages`.
+- `on.push` combines `tags` and `branches`: a tag push is never matched by `branches`, and a branch push is never matched by `tags`, so these are additive (tag push OR push to `main`), not ANDed. `check-tag` (and therefore `image`/`chart`, which `need` it and are skipped when it's skipped) only runs on a tag push; `dev-image` only runs on a push to `main` — the two flows never race on the same trigger.
+- `dev-image` pushes a moving `:dev` tag and an immutable `:sha-<short>` tag on every push to `main`, authenticated with the workflow's own `GITHUB_TOKEN` (`packages: write` above — no PAT, no repository secret). It builds `linux/amd64` only (the home cluster is amd64-only; an arm64 leg would double CI time for an image nothing schedules) and so needs no `docker/setup-qemu-action` step — unlike the release `image` job above, which stays multi-arch for public consumers of tagged releases.
 
 `.github/dependabot.yml`:
 
@@ -7175,7 +7204,7 @@ Expected: two `yaml-ok`, `actionlint` prints nothing (exit 0).
 
 ```bash
 git add .github Dockerfile
-git commit -m "ci: release workflow for multi-arch image and Helm chart, dependabot"
+git commit -m "ci: release workflow for multi-arch image and Helm chart, dev-image CI push, dependabot"
 ```
 
 ---
@@ -7187,22 +7216,21 @@ git commit -m "ci: release workflow for multi-arch image and Helm chart, dependa
 - Modify: `Makefile` (add `deploy-dev`, `undeploy-dev`), `README.md` (Development section)
 
 **Interfaces:**
-- Consumes: chart (Task 21), examples (Task 22), kubebuilder `docker-build`/`docker-push`/`docker-buildx` targets (`IMG` variable, `PLATFORMS` variable).
-- Produces: `make deploy-dev` → operator running from `ghcr.io/antnsn/alerts-operator:dev` in ns `alerts-operator` of the current kube-context; `docs/e2e.md` manual acceptance checklist.
+- Consumes: chart (Task 21), examples (Task 22), the `dev-image` job in `.github/workflows/release.yml` (Task 23), which publishes `ghcr.io/antnsn/alerts-operator:dev` and `:sha-<short-sha>` on every push to `main`.
+- Produces: `make deploy-dev` → operator running from the already-published `ghcr.io/antnsn/alerts-operator:dev` (or a pinned `:sha-<short-sha>`, via `DEV_IMG_TAG=`) in ns `alerts-operator` of the current kube-context; `docs/e2e.md` manual acceptance checklist.
 
 - [ ] **Step 1: Makefile targets**
 
 Append to `Makefile` under `##@ Helm`:
 
 ```make
-DEV_IMG ?= ghcr.io/antnsn/alerts-operator:dev
-DEV_NS  ?= alerts-operator
+DEV_IMG_TAG ?= dev
+DEV_NS      ?= alerts-operator
 
 .PHONY: deploy-dev
-deploy-dev: helm-sync-crds ## Build+push :dev for the cluster's node arch(s) and install the chart.
-	$(MAKE) docker-buildx IMG=$(DEV_IMG) PLATFORMS=$(DEV_PLATFORMS)
+deploy-dev: helm-sync-crds ## Install the chart against the already-published image at tag $(DEV_IMG_TAG) (built by the dev-image CI job; see docs/e2e.md).
 	helm upgrade --install alerts-operator $(CHART_DIR) -n $(DEV_NS) --create-namespace \
-		--set image.tag=dev --set image.pullPolicy=Always --wait
+		--set image.tag=$(DEV_IMG_TAG) --set image.pullPolicy=Always --wait
 
 .PHONY: undeploy-dev
 undeploy-dev: ## Uninstall the dev release. CRDs (and every CR) stay; see purge-dev-crds.
@@ -7216,16 +7244,7 @@ purge-dev-crds: ## Delete the CRDs — refuses while any Tenant/ContactPoint/Not
 		notificationpolicies.observability.antnsn.dev alertrulegroups.observability.antnsn.dev --ignore-not-found
 ```
 
-The scaffolded `docker-buildx` target prefixes its `buildx build --push` line with `-`, which makes Make ignore a failed build and `deploy-dev` would then install a stale image. Edit that target in the Makefile: remove the leading `-` from the `$(CONTAINER_TOOL) buildx build ...` line only (keep it on the `buildx create` and `buildx rm` lines, which are best-effort cleanup). Verify with `grep -n 'buildx build' Makefile` → line starts with a tab, no `-`.
-
-`DEV_PLATFORMS` defaults from node architectures:
-
-```make
-DEV_PLATFORMS ?= $(shell kubectl get nodes -o jsonpath='{range .items[*]}linux/{.status.nodeInfo.architecture}{"\n"}{end}' 2>/dev/null | sort -u | paste -sd, -)
-```
-(put this line above `deploy-dev`). Verify: `make -n deploy-dev` prints `docker-buildx IMG=ghcr.io/antnsn/alerts-operator:dev PLATFORMS=linux/amd64` (or `linux/amd64,linux/arm64`).
-
-`docker-buildx` needs a ghcr login once: `echo $GITHUB_TOKEN | docker login ghcr.io -u antnsn --password-stdin` (token with `write:packages`; `gh auth token` works if the gh scope includes it).
+`deploy-dev` no longer builds anything — the dev image is built and pushed by the `dev-image` job in `.github/workflows/release.yml` (Task 23) on every push to `main`. To deploy a specific, reproducible build instead of the moving `:dev` tag, override `DEV_IMG_TAG`, e.g. `make deploy-dev DEV_IMG_TAG=sha-abc1234`. No local Docker/buildx setup and no `docker login ghcr.io` are needed for this target; `kubectl` and `helm` against the target cluster are the only local prerequisites.
 
 - [ ] **Step 2: Runbook**
 
@@ -7251,8 +7270,20 @@ L=http://loki-gateway.loki
 ## 1. Deploy
 
 - [ ] `kubectl config current-context` shows the home cluster.
-- [ ] `kubectl get nodes -o wide` — note `ARCH` column; `make -n deploy-dev` shows matching `PLATFORMS=`.
-- [ ] `make deploy-dev` → ends with `STATUS: deployed`.
+- [ ] Pick the commit to test and record its short sha: `git rev-parse --short HEAD` (or the sha of whichever `main` commit's `dev-image` CI run — GitHub Actions tab, workflow `release` — you want to verify). Deploy that exact `sha-<short>` tag below, not the moving `:dev` tag, so the run is reproducible and tied to a known commit.
+- [ ] Confirm the image is published and pullable, using the cluster's own runtime rather than a local Docker install. (The image is distroless with no shell, so check the pull via the pod's Events rather than exec'ing anything inside it — the manager process itself may exit right after, for unrelated reasons like missing RBAC in the default namespace; that's fine, only the pull matters here.)
+
+  ```bash
+  kubectl run pull-check --image=ghcr.io/antnsn/alerts-operator:sha-<short> --restart=Never --image-pull-policy=Always
+  sleep 10 && kubectl describe pod pull-check | grep -E 'Pulled|Failed|BackOff'
+  kubectl delete pod pull-check --ignore-not-found
+  ```
+  Expected: an event line containing `Pulled` (successfully pulled), and no `Failed`/`BackOff` line. A pull failure here means either the `dev-image` job for that commit hasn't finished yet, or the package is still private (next bullet).
+- [ ] First publish only: the `dev-image` job's first push creates the `alerts-operator` package **private** under the user's GitHub packages, and nothing outside the account can pull it. Recommended, one-time: make it public —
+  `gh api -X PATCH /user/packages/container/alerts-operator/visibility -f visibility=public`
+  (equivalently: GitHub → your avatar → Packages → `alerts-operator` → Package settings → Danger Zone → Change visibility → Public). If it must stay private instead, create a pull secret and use it in place of `make deploy-dev`:
+  `kubectl create ns alerts-operator --dry-run=client -o yaml | kubectl apply -f - && kubectl -n alerts-operator create secret docker-registry ghcr --docker-server=ghcr.io --docker-username=antnsn --docker-password=$(gh auth token)`, then `helm upgrade --install alerts-operator charts/alerts-operator -n alerts-operator --set image.tag=sha-<short> --set image.pullPolicy=Always --set imagePullSecrets[0].name=ghcr --wait`.
+- [ ] `make deploy-dev DEV_IMG_TAG=sha-<short>` → ends with `STATUS: deployed`.
 - [ ] `kubectl -n alerts-operator get pods` → `1/1 Running`.
 - [ ] `kubectl -n alerts-operator logs deploy/alerts-operator | grep -c 'Starting workers'` → `4`.
 
@@ -7358,8 +7389,8 @@ Record the run date and any deviations in the vault session note.
 
 - [ ] **Step 3: Verify Makefile**
 
-Run: `make -n deploy-dev | head -3 && make -n undeploy-dev | head -1 && make -n purge-dev-crds | head -1`
-Expected: shows the `docker-buildx` and `helm upgrade --install` lines, then `helm uninstall`, then the CR-count guard.
+Run: `make -n deploy-dev | head -2 && make -n undeploy-dev | head -1 && make -n purge-dev-crds | head -1`
+Expected: shows only the `helm upgrade --install` line (with `--set image.tag=dev`, no `docker-buildx`), then `helm uninstall`, then the CR-count guard.
 
 - [ ] **Step 4: README**
 
@@ -7368,7 +7399,7 @@ In `README.md`, replace the `## Development` code block with:
 ```bash
 make test          # envtest + unit tests
 make chart-test    # helm lint + render assertions
-make deploy-dev    # push :dev image and install into the current kube-context (docs/e2e.md)
+make deploy-dev    # install the CI-built :dev image into the current kube-context (docs/e2e.md)
 make undeploy-dev  # remove the dev release (CRDs and CRs stay)
 make purge-dev-crds # delete the CRDs; refuses while any CR exists
 ```
