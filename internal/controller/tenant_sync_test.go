@@ -336,6 +336,67 @@ func TestTenantAlertmanagerRechecksBackendAfterGenerationChange(t *testing.T) {
 	}
 }
 
+// TestTenantAlertmanagerRechecksBackendAfterAuthRotation covers a follow-on Codex review finding on
+// the same cache: a Secret watch enqueues the Tenant on a backend-auth Secret change without ever
+// touching Generation, so gen+hash alone still can't tell a credential rotation from "nothing
+// changed" -- the previous fix (generation) doesn't cover it.
+func TestTenantAlertmanagerRechecksBackendAfterAuthRotation(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "am-auth", Namespace: "default"},
+		Data: map[string][]byte{"username": []byte("u1"), "password": []byte("p1")}}
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tn-am-auth", Generation: 1},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{
+			Address: s.URL,
+			Auth:    &observabilityv1alpha1.BackendAuth{BasicAuthSecretRef: &observabilityv1alpha1.NamespacedName{Namespace: "default", Name: "am-auth"}},
+		}},
+	}
+	keepCP := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "keep", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://keep"}}}}
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "pol", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "keep"}}}
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, sec, keepCP, pol), Recorder: record.NewFakeRecorder(20)}
+	var freshCP observabilityv1alpha1.ContactPoint
+	if err := r.Get(context.Background(), clientKey(keepCP), &freshCP); err != nil {
+		t.Fatal(err)
+	}
+	var freshPol observabilityv1alpha1.NotificationPolicy
+	if err := r.Get(context.Background(), clientKey(pol), &freshPol); err != nil {
+		t.Fatal(err)
+	}
+	ch := &children{Policy: &freshPol, ContactPoints: []observabilityv1alpha1.ContactPoint{freshCP}}
+	mc := mimir.New(backend.Options{Address: s.URL, TenantID: "1"})
+
+	if err := r.syncAlertmanager(context.Background(), tn, mc, ch); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPrefix(s.Requests(), "GET /api/v1/alerts"); n != 1 {
+		t.Fatalf("expected one AM GET on the first sync, got %d: %v", n, s.Requests())
+	}
+
+	// Rotate the secret's password without touching Tenant.Generation at all -- exactly how the
+	// Secret watch enqueues the Tenant.
+	var freshSec corev1.Secret
+	if err := r.Get(context.Background(), clientKey(sec), &freshSec); err != nil {
+		t.Fatal(err)
+	}
+	freshSec.Data["password"] = []byte("p2-rotated")
+	if err := r.Update(context.Background(), &freshSec); err != nil {
+		t.Fatal(err)
+	}
+
+	s.ResetRequests()
+	if err := r.syncAlertmanager(context.Background(), tn, mc, ch); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPrefix(s.Requests(), "GET /api/v1/alerts"); n != 1 {
+		t.Fatalf("a credential rotation must force a real backend check even when gen+hash are unchanged, got %d GETs: %v", n, s.Requests())
+	}
+}
+
 // TestSetChildSyncedRefreshesObservedGenerationOnRepeatOutcome covers a third Codex review finding:
 // setChildSynced's dedup short-circuit compared only status/reason/message, so a child re-validated
 // at a new generation whose outcome happens to match the previous one (e.g. True/Synced/"" both

@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -83,11 +85,14 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	}
 
 	hash := compile.HashAlertmanager(cfg)
-	// Keyed on gen too, not just hash+recency: a Tenant whose Policy/ContactPoints are unchanged
-	// (same hash) but whose spec.mimir.address or spec.tenantId just changed would otherwise report
-	// Synced from a cache entry that verified a *different* backend/tenant, skipping any real check
-	// against the new one until the resync interval next elapses.
-	if last := r.lastSync(tenant.Name); hash == tenant.Status.AlertmanagerConfigHash && last.gen == gen && time.Since(last.at) < tenant.Resync() {
+	// Keyed on gen and the resolved basic-auth credentials, not just hash+recency: a Tenant whose
+	// Policy/ContactPoints are unchanged (same hash) but whose spec.mimir.address or spec.tenantId
+	// just changed (gen) -- or whose backend-auth Secret was just rotated, which the Secret watch
+	// enqueues without touching gen at all -- would otherwise report Synced from a cache entry that
+	// verified a *different* backend/tenant/credential, skipping any real check until the resync
+	// interval next elapses.
+	auth := r.authFingerprint(ctx, tenant)
+	if last := r.lastSync(tenant.Name); hash == tenant.Status.AlertmanagerConfigHash && last.gen == gen && last.auth == auth && time.Since(last.at) < tenant.Resync() {
 		setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 		setChildren(nil)
 		return nil
@@ -117,19 +122,21 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 		}
 	}
 	tenant.Status.AlertmanagerConfigHash = hash
-	r.markSynced(tenant.Name, gen)
+	r.markSynced(tenant.Name, gen, auth)
 	setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 	setChildren(nil)
 	return nil
 }
 
-// amSyncState records when, and at what Tenant generation, syncAlertmanager last confirmed the
-// backend actually holds the compiled config -- the gen is what lets the hash+recency skip above
-// notice a backend/tenant identity change (spec.mimir.address, spec.tenantId) even when the compiled
-// document's content, and therefore its hash, hasn't changed.
+// amSyncState records when, at what Tenant generation, and against what backend-auth credentials
+// syncAlertmanager last confirmed the backend actually holds the compiled config -- gen and auth are
+// what let the hash+recency skip above notice a backend/tenant/credential identity change
+// (spec.mimir.address, spec.tenantId, or the referenced auth Secret's content) even when the
+// compiled document's content, and therefore its hash, hasn't changed.
 type amSyncState struct {
-	at  time.Time
-	gen int64
+	at   time.Time
+	gen  int64
+	auth string
 }
 
 func (r *TenantReconciler) lastSync(name string) amSyncState {
@@ -138,13 +145,33 @@ func (r *TenantReconciler) lastSync(name string) amSyncState {
 	return r.lastAMSync[name]
 }
 
-func (r *TenantReconciler) markSynced(name string, gen int64) {
+func (r *TenantReconciler) markSynced(name string, gen int64, auth string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.lastAMSync == nil {
 		r.lastAMSync = map[string]amSyncState{}
 	}
-	r.lastAMSync[name] = amSyncState{at: time.Now(), gen: gen}
+	r.lastAMSync[name] = amSyncState{at: time.Now(), gen: gen, auth: auth}
+}
+
+// authFingerprint returns a value that changes whenever the Tenant's Mimir basic-auth credentials
+// do, so the hash+recency skip above can't mistake a credential rotation -- which the Secret watch
+// enqueues without touching Generation at all -- for "nothing changed." Best-effort: a resolution
+// error yields a fingerprint that includes the error text, which simply won't match whatever was
+// cached, forcing a real backend check rather than trusting a fingerprint we couldn't confirm.
+func (r *TenantReconciler) authFingerprint(ctx context.Context, tenant *v1alpha1.Tenant) string {
+	if tenant.Spec.Mimir == nil {
+		return ""
+	}
+	o, err := r.backendOptions(ctx, tenant, tenant.Spec.Mimir)
+	if err != nil {
+		return "err:" + err.Error()
+	}
+	if o.BasicAuth == nil {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(o.BasicAuth.Username + "\x00" + o.BasicAuth.Password))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // secretResolver reads Secret keys through the cached client.
