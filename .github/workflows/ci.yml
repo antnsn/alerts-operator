@@ -13,5 +13,5 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with: { version: v2.13.2 }
       - run: make test
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: make chart-test
