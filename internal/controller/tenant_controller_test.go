@@ -77,66 +77,22 @@ func TestTenantListChildrenFiltersAccepted(t *testing.T) {
 	}
 }
 
-// TestTenantListChildrenStaleGeneration covers listChildren's stale-generation branch: a child
-// whose Accepted condition is missing, or lags its current generation, must NOT be treated as
-// desired (excluded from the returned slices, same as a validated rejection) but must also NOT be
-// treated as no-longer-desired (an AlertRuleGroup's backend namespace lands in KeepNamespaces
-// instead of being pruned; a ContactPoint/NotificationPolicy sets PendingAM instead of letting the
-// Alertmanager write proceed on stale data).
-//
-// This uses an isolated fake client (not testClient/testCacheClient) seeded with objects whose
-// generation/status are set directly, rather than racing the real envtest reconcilers: those
-// reconcilers are live and watching every ContactPoint/NotificationPolicy/AlertRuleGroup in the
-// shared suite, so a spec edit meant to produce a transient "stale" window would be reconciled
-// away asynchronously — not deterministically observable. Seeding a fake client with the desired
-// generation/condition combination directly tests listChildren's classification without that race.
-func TestTenantListChildrenStaleGeneration(t *testing.T) {
-	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "tn-stale"}, Spec: observabilityv1alpha1.TenantSpec{TenantID: "1"}}
+// acceptedAt builds a single Accepted=True condition observed at the given generation, for
+// constructing fake-client fixtures directly (see TestTenantListChildrenStaleGeneration).
+func acceptedAt(gen int64) []metav1.Condition {
+	return []metav1.Condition{{Type: observabilityv1alpha1.ConditionAccepted, Status: metav1.ConditionTrue, Reason: observabilityv1alpha1.ReasonAccepted, ObservedGeneration: gen}}
+}
 
-	acceptedAt := func(gen int64) []metav1.Condition {
-		return []metav1.Condition{{Type: observabilityv1alpha1.ConditionAccepted, Status: metav1.ConditionTrue, Reason: observabilityv1alpha1.ReasonAccepted, ObservedGeneration: gen}}
-	}
-
-	// Accepted-current: Generation == the Accepted condition's ObservedGeneration. Included normally.
-	currentARG := &observabilityv1alpha1.AlertRuleGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: "current-arg", Namespace: "default", Generation: 1},
-		Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
-		Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
-	}
-	// Stale: a spec edit bumped Generation to 2 but this AlertRuleGroup's own reconciler hasn't
-	// re-validated it yet (ObservedGeneration still 1). Must be kept, not pruned.
-	staleARG := &observabilityv1alpha1.AlertRuleGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: "stale-arg", Namespace: "default", Generation: 2},
-		Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
-		Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
-	}
-	// Stale via the other disjunct: no Accepted condition at all (never reconciled).
-	missingARG := &observabilityv1alpha1.AlertRuleGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: "missing-arg", Namespace: "default", Generation: 1},
-		Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
-	}
-	currentCP := &observabilityv1alpha1.ContactPoint{
-		ObjectMeta: metav1.ObjectMeta{Name: "current-cp", Namespace: "default", Generation: 1},
-		Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
-		Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
-	}
-	staleCP := &observabilityv1alpha1.ContactPoint{
-		ObjectMeta: metav1.ObjectMeta{Name: "stale-cp", Namespace: "default", Generation: 2},
-		Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
-		Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
-	}
-	currentNP := &observabilityv1alpha1.NotificationPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "current-pol", Namespace: "default", Generation: 1},
-		Spec:       observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "current-cp"}},
-		Status:     observabilityv1alpha1.NotificationPolicyStatus{Conditions: acceptedAt(1)},
-	}
-	staleNP := &observabilityv1alpha1.NotificationPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "stale-pol", Namespace: "default", Generation: 2},
-		Spec:       observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "stale-cp"}},
-		Status:     observabilityv1alpha1.NotificationPolicyStatus{Conditions: acceptedAt(1)},
-	}
-
-	fc := fake.NewClientBuilder().
+// newChildrenFakeClient builds an isolated (non-envtest) fake client seeded with objs, indexed on
+// index.IndexTenantRef exactly like the production manager's cache. Used instead of
+// testClient/testCacheClient because the real envtest reconcilers are live and watching every
+// ContactPoint/NotificationPolicy/AlertRuleGroup in the shared suite: a spec edit meant to produce
+// a transient "stale generation" window would be reconciled away asynchronously and is not
+// deterministically observable. Seeding a fake client with the desired generation/condition
+// combination directly tests listChildren's classification without that race.
+func newChildrenFakeClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithIndex(&observabilityv1alpha1.ContactPoint{}, index.IndexTenantRef, func(o client.Object) []string {
 			return []string{o.(*observabilityv1alpha1.ContactPoint).Spec.TenantRef}
@@ -147,34 +103,113 @@ func TestTenantListChildrenStaleGeneration(t *testing.T) {
 		WithIndex(&observabilityv1alpha1.AlertRuleGroup{}, index.IndexTenantRef, func(o client.Object) []string {
 			return []string{o.(*observabilityv1alpha1.AlertRuleGroup).Spec.TenantRef}
 		}).
-		WithObjects(currentARG, staleARG, missingARG, currentCP, staleCP, currentNP, staleNP).
+		WithObjects(objs...).
 		Build()
+}
 
-	r := &TenantReconciler{Client: fc}
-	ch, err := r.listChildren(context.Background(), tn)
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestTenantListChildrenStaleGeneration covers listChildren's stale-generation branch: a child
+// whose Accepted condition is missing, or lags its current generation, must NOT be treated as
+// desired (excluded from the returned slices, same as a validated rejection) but must also NOT be
+// treated as no-longer-desired (an AlertRuleGroup's backend namespace lands in KeepNamespaces
+// instead of being pruned; a ContactPoint/NotificationPolicy sets PendingAM instead of letting the
+// Alertmanager write proceed on stale data).
+//
+// Each stale source (AlertRuleGroup / ContactPoint / NotificationPolicy) gets its own subtest with
+// only that kind's stale object present: a single scenario with both a stale ContactPoint and a
+// stale NotificationPolicy would still show PendingAM=true even if listChildren stopped setting it
+// for one of the two kinds, since the other would mask the regression.
+func TestTenantListChildrenStaleGeneration(t *testing.T) {
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "tn-stale"}, Spec: observabilityv1alpha1.TenantSpec{TenantID: "1"}}
 
-	if len(ch.MimirGroups) != 1 || ch.MimirGroups[0].Name != "current-arg" {
-		t.Fatalf("accepted-current AlertRuleGroup should be the only one included: %+v", ch.MimirGroups)
-	}
-	wantKeep := map[string]bool{
-		compile.BackendNamespace(tn.Prefix(), "default", "stale-arg"):   true,
-		compile.BackendNamespace(tn.Prefix(), "default", "missing-arg"): true,
-	}
-	if !reflect.DeepEqual(ch.KeepNamespaces, wantKeep) {
-		t.Fatalf("KeepNamespaces = %+v, want %+v (stale/missing AlertRuleGroups must be kept, not pruned)", ch.KeepNamespaces, wantKeep)
-	}
-	if len(ch.ContactPoints) != 1 || ch.ContactPoints[0].Name != "current-cp" {
-		t.Fatalf("accepted-current ContactPoint should be the only one included: %+v", ch.ContactPoints)
-	}
-	if ch.Policy == nil || ch.Policy.Name != "current-pol" {
-		t.Fatalf("accepted-current NotificationPolicy should win: %+v", ch.Policy)
-	}
-	if !ch.PendingAM {
-		t.Fatalf("a stale ContactPoint or NotificationPolicy must set PendingAM so the Alertmanager write is deferred")
-	}
+	t.Run("alert rule groups", func(t *testing.T) {
+		// Accepted-current: Generation == the Accepted condition's ObservedGeneration. Included normally.
+		currentARG := &observabilityv1alpha1.AlertRuleGroup{
+			ObjectMeta: metav1.ObjectMeta{Name: "current-arg", Namespace: "default", Generation: 1},
+			Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
+			Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+		}
+		// Stale: a spec edit bumped Generation to 2 but this AlertRuleGroup's own reconciler
+		// hasn't re-validated it yet (ObservedGeneration still 1). Must be kept, not pruned.
+		staleARG := &observabilityv1alpha1.AlertRuleGroup{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale-arg", Namespace: "default", Generation: 2},
+			Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
+			Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+		}
+		// Stale via the other disjunct: no Accepted condition at all (never reconciled).
+		missingARG := &observabilityv1alpha1.AlertRuleGroup{
+			ObjectMeta: metav1.ObjectMeta{Name: "missing-arg", Namespace: "default", Generation: 1},
+			Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
+		}
+
+		r := &TenantReconciler{Client: newChildrenFakeClient(t, currentARG, staleARG, missingARG)}
+		ch, err := r.listChildren(context.Background(), tn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ch.MimirGroups) != 1 || ch.MimirGroups[0].Name != "current-arg" {
+			t.Fatalf("accepted-current AlertRuleGroup should be the only one included: %+v", ch.MimirGroups)
+		}
+		wantKeep := map[string]bool{
+			compile.BackendNamespace(tn.Prefix(), "default", "stale-arg"):   true,
+			compile.BackendNamespace(tn.Prefix(), "default", "missing-arg"): true,
+		}
+		if !reflect.DeepEqual(ch.KeepNamespaces, wantKeep) {
+			t.Fatalf("KeepNamespaces = %+v, want %+v (stale/missing AlertRuleGroups must be kept, not pruned)", ch.KeepNamespaces, wantKeep)
+		}
+		if ch.PendingAM {
+			t.Fatalf("a stale AlertRuleGroup must not set PendingAM (that's only for ContactPoint/NotificationPolicy)")
+		}
+	})
+
+	t.Run("stale contact point sets PendingAM", func(t *testing.T) {
+		currentCP := &observabilityv1alpha1.ContactPoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "current-cp", Namespace: "default", Generation: 1},
+			Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
+			Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
+		}
+		staleCP := &observabilityv1alpha1.ContactPoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale-cp", Namespace: "default", Generation: 2},
+			Spec:       observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}},
+			Status:     observabilityv1alpha1.ContactPointStatus{Conditions: acceptedAt(1)},
+		}
+
+		r := &TenantReconciler{Client: newChildrenFakeClient(t, currentCP, staleCP)}
+		ch, err := r.listChildren(context.Background(), tn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ch.ContactPoints) != 1 || ch.ContactPoints[0].Name != "current-cp" {
+			t.Fatalf("accepted-current ContactPoint should be the only one included: %+v", ch.ContactPoints)
+		}
+		if !ch.PendingAM {
+			t.Fatalf("a stale ContactPoint alone must set PendingAM so the Alertmanager write is deferred")
+		}
+	})
+
+	t.Run("stale notification policy sets PendingAM", func(t *testing.T) {
+		currentNP := &observabilityv1alpha1.NotificationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "current-pol", Namespace: "default", Generation: 1},
+			Spec:       observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "x"}},
+			Status:     observabilityv1alpha1.NotificationPolicyStatus{Conditions: acceptedAt(1)},
+		}
+		staleNP := &observabilityv1alpha1.NotificationPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale-pol", Namespace: "default", Generation: 2},
+			Spec:       observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "x"}},
+			Status:     observabilityv1alpha1.NotificationPolicyStatus{Conditions: acceptedAt(1)},
+		}
+
+		r := &TenantReconciler{Client: newChildrenFakeClient(t, currentNP, staleNP)}
+		ch, err := r.listChildren(context.Background(), tn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ch.Policy == nil || ch.Policy.Name != "current-pol" {
+			t.Fatalf("accepted-current NotificationPolicy should win: %+v", ch.Policy)
+		}
+		if !ch.PendingAM {
+			t.Fatalf("a stale NotificationPolicy alone must set PendingAM so the Alertmanager write is deferred")
+		}
+	})
 }
 
 // TestTenantBackendOptionsSecretResolution covers backendOptions's BasicAuthSecretRef resolution:
@@ -231,23 +266,38 @@ func TestTenantBackendOptionsSecretResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("wrong namespace is not resolved", func(t *testing.T) {
-		// "kube-system" is bootstrapped by the API server itself (unlike a namespace we'd create
-		// and delete ourselves, which envtest never finishes terminating, since no namespace
-		// controller runs there): a Secret placed in it, referenced with a different Namespace in
-		// BasicAuthSecretRef, proves ref.Namespace is what's actually read from, not the Secret's
-		// real namespace or some hardcoded default.
-		sec := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "bo-shared-name", Namespace: "kube-system"},
-			Data:       map[string][]byte{"username": []byte("alice"), "password": []byte("s3cr3t")},
+	t.Run("resolves from the referenced namespace, not another one with the same name", func(t *testing.T) {
+		// Two Secrets with the SAME name but DIFFERENT data, in two different (pre-existing, so
+		// nothing needs creating/cleaning up a Namespace object -- see the envtest note below)
+		// namespaces. Referencing "kube-system" must come back with kube-system's data: if the
+		// code ignored ref.Namespace and always read "default" (or the Secret's own eventual
+		// namespace by some other means), this would silently return "default"'s credentials
+		// instead and the test would catch it.
+		//
+		// "kube-system" is bootstrapped by the API server itself, unlike a namespace we'd create
+		// via testClient.Create: envtest runs no namespace controller, so a namespace we deleted
+		// ourselves would sit in Terminating forever and break a second run within the same
+		// envtest instance (e.g. -count=2).
+		defaultSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "bo-shared-name", Namespace: "default"},
+			Data:       map[string][]byte{"username": []byte("default-user"), "password": []byte("default-pass")},
 		}
-		createAndCleanup(t, sec)
+		createAndCleanup(t, defaultSec)
+		kubeSystemSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "bo-shared-name", Namespace: "kube-system"},
+			Data:       map[string][]byte{"username": []byte("kube-system-user"), "password": []byte("kube-system-pass")},
+		}
+		createAndCleanup(t, kubeSystemSec)
+
 		spec := &observabilityv1alpha1.BackendSpec{Address: "http://backend", Auth: &observabilityv1alpha1.BackendAuth{
-			BasicAuthSecretRef: &observabilityv1alpha1.NamespacedName{Namespace: "default", Name: "bo-shared-name"},
+			BasicAuthSecretRef: &observabilityv1alpha1.NamespacedName{Namespace: "kube-system", Name: "bo-shared-name"},
 		}}
-		_, err := r.backendOptions(testCtx, tn, spec)
-		if err == nil || !strings.Contains(err.Error(), "not found") {
-			t.Fatalf("secret in the wrong namespace must not resolve: %v", err)
+		o, err := r.backendOptions(testCtx, tn, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.BasicAuth == nil || o.BasicAuth.Username != "kube-system-user" || o.BasicAuth.Password != "kube-system-pass" {
+			t.Fatalf("must resolve from the referenced namespace (kube-system), not default: %+v", o.BasicAuth)
 		}
 	})
 }
