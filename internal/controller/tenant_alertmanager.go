@@ -17,6 +17,7 @@ import (
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 	"github.com/antnsn/alerts-operator/internal/compile"
+	"github.com/antnsn/alerts-operator/internal/metrics"
 )
 
 // syncAlertmanager compiles and pushes the tenant's Alertmanager document. It sets
@@ -104,6 +105,7 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 		setTenant(status, reason, msg)
 		setChildren(err)
 		r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "AlertmanagerGetFailed", "%v", err)
+		metrics.Observe(tenant.Name, metrics.TargetAlertmanager, err)
 		if backend.IsUnavailable(err) {
 			return err
 		}
@@ -115,6 +117,7 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 			setTenant(status, reason, msg)
 			setChildren(err)
 			r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "AlertmanagerSetFailed", "%v", err)
+			metrics.Observe(tenant.Name, metrics.TargetAlertmanager, err)
 			if backend.IsUnavailable(err) {
 				return err
 			}
@@ -123,6 +126,7 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	}
 	tenant.Status.AlertmanagerConfigHash = hash
 	r.markSynced(tenant.Name, gen, auth)
+	metrics.Observe(tenant.Name, metrics.TargetAlertmanager, nil)
 	setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 	setChildren(nil)
 	return nil

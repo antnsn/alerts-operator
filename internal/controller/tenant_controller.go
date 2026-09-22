@@ -42,6 +42,7 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend/mimir"
 	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
+	"github.com/antnsn/alerts-operator/internal/metrics"
 )
 
 const tenantFinalizer = "observability.antnsn.dev/tenant"
@@ -60,8 +61,24 @@ type TenantReconciler struct {
 	NewMimir func(backend.Options) MimirClient
 	NewLoki  func(backend.Options) backend.RuleStore
 
+	// APIReader reads straight from the API server, bypassing the controller-runtime cache. Set by
+	// SetupWithManager (mgr.GetAPIReader()); nil in tests that construct a TenantReconciler directly,
+	// which fall back to Client (see apiReader). Used only by claimants (tenant_finalizer.go): that
+	// read gates an irreversible RemoveFinalizer, so it must not risk acting on a cache that hasn't
+	// yet caught up with a colliding Tenant's own just-completed deletion.
+	APIReader client.Reader
+
 	mu         sync.Mutex // guards lastAMSync, read/written from syncAlertmanager
 	lastAMSync map[string]amSyncState
+}
+
+// apiReader returns APIReader, or Client when APIReader is unset (a TenantReconciler built without
+// going through SetupWithManager, as most unit tests do).
+func (r *TenantReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // children are the Accepted CRs referencing one Tenant, plus what's known about children that are
@@ -106,6 +123,10 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			r.Recorder.Eventf(&tenant, corev1.EventTypeWarning, "FinalizeFailed", "%v", err)
 			return ctrl.Result{}, err
 		}
+		// Metrics only, never behaviour (see internal/metrics doc comment on DeleteTenant): drop this
+		// Tenant's series now that its backend footprint is actually gone, rather than retaining them
+		// for the life of the process.
+		metrics.DeleteTenant(tenant.Name)
 		controllerutil.RemoveFinalizer(&tenant, tenantFinalizer)
 		return ctrl.Result{}, r.Update(ctx, &tenant)
 	}
@@ -337,12 +358,6 @@ func (r *TenantReconciler) lokiClient(ctx context.Context, tenant *v1alpha1.Tena
 	return loki.New(o), nil
 }
 
-// --- stub replaced in Task 20 ---
-
-// finalize is a stub: Task 20 fills in the real backend cleanup (deleting the tenant's rule
-// groups and Alertmanager config).
-func (r *TenantReconciler) finalize(_ context.Context, _ *v1alpha1.Tenant) error { return nil }
-
 // --- watches ---
 
 // secretToTenants maps a Secret to tenants using it for basic auth and to tenants of ContactPoints referencing it.
@@ -400,6 +415,9 @@ func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// different (recorder.EventRecorder) type; Recorder's field type is record.EventRecorder
 		// (k8s.io/client-go/tools/record), so this is the correct constructor for it.
 		r.Recorder = mgr.GetEventRecorderFor("tenant-controller") //nolint:staticcheck // record.EventRecorder is the field type
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 	r.lastAMSync = map[string]amSyncState{}
 	return ctrl.NewControllerManagedBy(mgr).

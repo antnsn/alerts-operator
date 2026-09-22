@@ -159,11 +159,19 @@ func TestTenantIDImmutable(t *testing.T) {
 	srv := fake.New()
 	defer srv.Close()
 
-	tn := createTenant(t, "cel-tenantid", observabilityv1alpha1.TenantSpec{
-		TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "tenantid-test",
+	// Run createTenant's Delete-and-wait cleanup inside a subtest (mirroring
+	// TestTenantRulesNamespacePrefixImmutable above): t.Run blocks until the subtest and its
+	// Cleanup funcs finish, so the Tenant is gone -- and Task 20's finalizer has had a chance to
+	// reach the backend -- before the outer defer closes srv. Registering createTenant's Cleanup
+	// directly on the outer t would instead run it after that defer, against an already-closed
+	// server, and the finalizer would never complete, hanging Delete's own wait.
+	t.Run("tenantId cannot change", func(t *testing.T) {
+		tn := createTenant(t, "cel-tenantid", observabilityv1alpha1.TenantSpec{
+			TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "tenantid-test",
+		})
+		err := updateAwaitingVerdict(t, tn, func(cur *observabilityv1alpha1.Tenant) { cur.Spec.TenantID = "2" })
+		assertCELRejected(t, err, "tenantId is immutable")
 	})
-	err := updateAwaitingVerdict(t, tn, func(cur *observabilityv1alpha1.Tenant) { cur.Spec.TenantID = "2" })
-	assertCELRejected(t, err, "tenantId is immutable")
 }
 
 func TestTenantDefaults(t *testing.T) {

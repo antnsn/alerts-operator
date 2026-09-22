@@ -12,6 +12,7 @@ import (
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 	"github.com/antnsn/alerts-operator/internal/compile"
+	"github.com/antnsn/alerts-operator/internal/metrics"
 )
 
 // syncRules makes the backend's rule namespaces under the tenant prefix match the accepted groups.
@@ -24,8 +25,10 @@ import (
 // The returned error is non-nil only when the backend was unavailable (caller backs off).
 func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenant, store backend.RuleStore, be v1alpha1.Backend, groups []v1alpha1.AlertRuleGroup, keep map[string]bool) (int32, error) {
 	condType := v1alpha1.ConditionMimirRulesSynced
+	target := metrics.TargetMimirRules
 	if be == v1alpha1.BackendLoki {
 		condType = v1alpha1.ConditionLokiRulesSynced
+		target = metrics.TargetLokiRules
 	}
 	prefix := tenant.Prefix() + "/"
 	desired := compile.Rules(tenant.Prefix(), groups)
@@ -49,6 +52,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 		for i := range groups {
 			r.setChildSynced(ctx, &groups[i], err)
 		}
+		metrics.Observe(tenant.Name, target, err)
 		if backend.IsUnavailable(err) {
 			return desiredCount, err
 		}
@@ -175,6 +179,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 		status, reason, msg = metav1.ConditionUnknown, v1alpha1.ReasonPending, "waiting for child validation"
 	}
 	setCondition(&tenant.Status.Conditions, condType, status, reason, msg, tenant.Generation)
+	metrics.Observe(tenant.Name, target, worst)
 	if worst != nil && backend.IsUnavailable(worst) {
 		return desiredCount, worst
 	}

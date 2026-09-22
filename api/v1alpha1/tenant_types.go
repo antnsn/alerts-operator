@@ -95,9 +95,20 @@ type TenantSpec struct {
 }
 
 // RuleGroupCounts tracks the number of rule groups per backend.
+//
+// Both fields carry +kubebuilder:default=0 despite being required: a status patch is a JSON merge
+// patch built from a before/after diff (see patchStatus in internal/controller/conditions.go), so
+// the very first time only one of Mimir/Loki moves off its Go zero value, the generated patch omits
+// the untouched sibling entirely. Applied to a stored object that has never had a ruleGroups key at
+// all, that produces a partial {mimir: 1} (or {loki: 1}) object missing its required sibling, which
+// CRD structural-schema validation rejects -- permanently, since the same partial diff recurs every
+// reconcile. The default lets the API server's structural-schema defaulting fill the missing sibling
+// in before required-validation runs, so a partial patch still resolves to a valid object.
 type RuleGroupCounts struct {
+	// +kubebuilder:default=0
 	Mimir int32 `json:"mimir"`
-	Loki  int32 `json:"loki"`
+	// +kubebuilder:default=0
+	Loki int32 `json:"loki"`
 }
 
 // TenantStatus defines the observed state of Tenant.
