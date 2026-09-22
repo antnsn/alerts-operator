@@ -363,3 +363,35 @@ func TestSetChildSyncedRefreshesObservedGenerationOnRepeatOutcome(t *testing.T) 
 		t.Fatalf("Synced.ObservedGeneration must track the object's current generation even when the outcome is unchanged, got %+v", c)
 	}
 }
+
+// TestSyncRulesPreservesDesiredCountOnListFailure covers a fourth Codex review finding: on a
+// store.List failure, syncRules used to return 0 regardless of how many groups the accepted
+// AlertRuleGroups call for -- inconsistent with the success path, which reports that same desired
+// count even when some per-namespace writes fail. Zeroing it out on a transient list error would
+// misreport "no rule groups" in Tenant status while the groups most likely remain installed exactly
+// as before.
+func TestSyncRulesPreservesDesiredCountOnListFailure(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+	s.Fail(503)
+
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "tn-count"}, Spec: observabilityv1alpha1.TenantSpec{TenantID: "1"}}
+	mimirG := &observabilityv1alpha1.AlertRuleGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default", Generation: 1},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: []observabilityv1alpha1.RuleGroup{
+			{Name: "g1", Rules: []observabilityv1alpha1.Rule{{Alert: "A", Expr: "up == 0"}}},
+			{Name: "g2", Rules: []observabilityv1alpha1.Rule{{Alert: "B", Expr: "up == 1"}}},
+		}},
+		Status: observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+	}
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, mimirG), Recorder: record.NewFakeRecorder(20)}
+	mc := mimir.New(backend.Options{Address: s.URL, TenantID: "1"})
+	n, err := r.syncRules(context.Background(), tn, mc, observabilityv1alpha1.BackendMimir, []observabilityv1alpha1.AlertRuleGroup{*mimirG}, map[string]bool{})
+	if !backend.IsUnavailable(err) {
+		t.Fatalf("expected an unavailable error, got %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("desired count must be preserved on a List failure, got %d want 2", n)
+	}
+}

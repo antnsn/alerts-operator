@@ -28,6 +28,17 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	}
 	prefix := tenant.Prefix() + "/"
 	desired := compile.Rules(tenant.Prefix(), groups)
+	// Computed once, up front: this is "how many groups the accepted AlertRuleGroups call for," not
+	// a backend-confirmed count -- the diff loop below reports the same desired total even when some
+	// per-namespace writes fail, so a List failure must report it too rather than 0. Zeroing it out
+	// on a transient list error would misreport "no rule groups" in status while the groups most
+	// likely remain installed exactly as before; we just couldn't confirm that this pass.
+	var desiredCount int32
+	for ns, want := range desired {
+		if !keep[ns] {
+			desiredCount += int32(len(want))
+		}
+	}
 
 	actual, err := store.List(ctx)
 	if err != nil {
@@ -38,18 +49,16 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 			r.setChildSynced(ctx, &groups[i], err)
 		}
 		if backend.IsUnavailable(err) {
-			return 0, err
+			return desiredCount, err
 		}
-		return 0, nil // 4xx: wait for the next change or resync, no backoff loop
+		return desiredCount, nil // 4xx: wait for the next change or resync, no backoff loop
 	}
 
 	nsErr := map[string]error{}
-	var count int32
 	for ns, want := range desired {
 		if keep[ns] {
 			continue
 		}
-		count += int32(len(want))
 		have := actual[ns]
 		if compile.RulesEqual(have, want) {
 			continue
@@ -114,9 +123,9 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	status, reason, msg := syncedFromErr(worst)
 	setCondition(&tenant.Status.Conditions, condType, status, reason, msg, tenant.Generation)
 	if worst != nil && backend.IsUnavailable(worst) {
-		return count, worst
+		return desiredCount, worst
 	}
-	return count, nil
+	return desiredCount, nil
 }
 
 // worstErr prefers an unavailable error (retryable) over a rejection.
