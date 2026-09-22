@@ -88,7 +88,25 @@ func TestNotificationPolicyAccepted(t *testing.T) {
 	createAndCleanup(t, later)
 	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
 
-	// ContactPoint bound to a different tenant does not count.
+	// Second valid policy for the same tenant → Conflict naming the winner (np-a, still the oldest).
+	//
+	// Created (and named) before "wrong" below on purpose: CreationTimestamp only has 1s
+	// resolution, so after np-a is deleted, policyWinner among {second, wrong} must not depend on
+	// which wall-clock second either Create happened to land in. Creating "second" first makes its
+	// CreationTimestamp never later than "wrong"'s, and "np-b" also sorts before "np-wrong"
+	// lexicographically, so it wins the post-promotion race whether or not the two Creates tie.
+	second := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np-b", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: "np-tenant", Route: observabilityv1alpha1.Route{Receiver: "np-keep"}}}
+	createAndCleanup(t, second)
+	waitCondition(t, second, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonConflict)
+	if !strings.Contains(findCond(second, observabilityv1alpha1.ConditionAccepted).Message, "default/np-a") {
+		t.Fatalf("conflict message should name winner: %q", findCond(second, observabilityv1alpha1.ConditionAccepted).Message)
+	}
+	// Winner stays accepted.
+	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+
+	// ContactPoint bound to a different tenant does not count. "wrong" is created after "second"
+	// (see comment above) so it can never outrank "second" for the post-promotion winner slot.
 	otherTenantCP := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "np-other", Namespace: "default"},
 		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: "np-tenant-2", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://o"}}}}
 	createAndCleanup(t, otherTenantCP)
@@ -101,18 +119,7 @@ func TestNotificationPolicyAccepted(t *testing.T) {
 		return c.Status == metav1.ConditionFalse && (c.Reason == observabilityv1alpha1.ReasonContactPointNotFound || c.Reason == observabilityv1alpha1.ReasonConflict)
 	})
 
-	// Second valid policy for the same tenant → Conflict naming the winner.
-	second := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np-b", Namespace: "default"},
-		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: "np-tenant", Route: observabilityv1alpha1.Route{Receiver: "np-keep"}}}
-	createAndCleanup(t, second)
-	waitCondition(t, second, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonConflict)
-	if !strings.Contains(findCond(second, observabilityv1alpha1.ConditionAccepted).Message, "default/np-a") {
-		t.Fatalf("conflict message should name winner: %q", findCond(second, observabilityv1alpha1.ConditionAccepted).Message)
-	}
-	// Winner stays accepted.
-	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
-
-	// Deleting the winner promotes the second.
+	// Deleting the winner promotes "second" (deterministically: see comment above).
 	if err := testClient.Delete(testCtx, pol); err != nil {
 		t.Fatal(err)
 	}
