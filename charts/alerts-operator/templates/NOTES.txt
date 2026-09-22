@@ -9,5 +9,5 @@ Next:
        kubectl get contactpoints,notificationpolicies,alertrulegroups -A
 {{- if .Values.metrics.enabled }}
 
-Metrics: http://{{ include "alerts-operator.fullname" . }}-metrics.{{ .Release.Namespace }}.svc:{{ .Values.metrics.service.port }}/metrics
+Metrics: http://{{ include "alerts-operator.metricsServiceName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.metrics.service.port }}/metrics
 {{- end }}

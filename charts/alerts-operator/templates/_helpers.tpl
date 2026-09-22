@@ -38,3 +38,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "alerts-operator.image" -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
+
+{{/*
+Service names must fit RFC 1035 label rules (63 chars), unlike most other
+object names (RFC 1123 subdomain, 253 chars). "alerts-operator.fullname" is
+already truncated to 63 on its own, so appending "-metrics" to it can still
+overflow 63 for a long release name or fullnameOverride - truncate the
+combined name too.
+*/}}
+{{- define "alerts-operator.metricsServiceName" -}}
+{{- printf "%s-metrics" (include "alerts-operator.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}

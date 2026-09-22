@@ -13,10 +13,14 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "alerts-operator.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- /* Rendered last so a colliding key in podLabels (e.g. app.kubernetes.io/name)
+              can never win: YAML/JSON decoding takes the last value for a duplicate key,
+              and these two labels must match spec.selector.matchLabels exactly or the
+              API server rejects the Deployment. */}}
+        {{- include "alerts-operator.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
