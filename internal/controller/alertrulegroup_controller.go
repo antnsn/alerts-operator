@@ -19,46 +19,121 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/prometheus/common/model"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/compile"
+	"github.com/antnsn/alerts-operator/internal/index"
 )
 
-// AlertRuleGroupReconciler reconciles a AlertRuleGroup object
+// AlertRuleGroupReconciler validates AlertRuleGroups and sets Accepted. It never writes to a backend.
 type AlertRuleGroupReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=alertrulegroups,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=alertrulegroups,verbs=get;list;watch
 // +kubebuilder:rbac:groups=observability.antnsn.dev,resources=alertrulegroups/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=alertrulegroups/finalizers,verbs=update
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=tenants,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the AlertRuleGroup object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
-func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+// Reconcile validates the AlertRuleGroup against its referenced Tenant and rule syntax, then
+// sets the Accepted condition. It never writes to a backend -- that is the Tenant reconciler's job.
+func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var arg v1alpha1.AlertRuleGroup
+	if err := r.Get(ctx, req.NamespacedName, &arg); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-	// TODO(user): your logic here
+	status, reason, msg := metav1.ConditionTrue, v1alpha1.ReasonAccepted, ""
+	backendNS := ""
 
-	return ctrl.Result{}, nil
+	var tenant v1alpha1.Tenant
+	switch err := r.Get(ctx, types.NamespacedName{Name: arg.Spec.TenantRef}, &tenant); {
+	case errors.IsNotFound(err):
+		status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonTenantNotFound, fmt.Sprintf("Tenant %q not found", arg.Spec.TenantRef)
+	case err != nil:
+		return ctrl.Result{}, err
+	default:
+		backendNS = compile.BackendNamespace(tenant.Prefix(), arg.Namespace, arg.Name)
+		switch {
+		case arg.Spec.Backend == v1alpha1.BackendMimir && tenant.Spec.Mimir == nil,
+			arg.Spec.Backend == v1alpha1.BackendLoki && tenant.Spec.Loki == nil:
+			status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonBackendNotConfigured, fmt.Sprintf("Tenant %q has no %s backend", tenant.Name, arg.Spec.Backend)
+		default:
+			if verr := validateRuleGroups(arg.Spec.Backend, arg.Spec.Groups); verr != nil {
+				status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonInvalidRule, verr.Error()
+			}
+		}
+	}
+
+	changed := false
+	err := patchStatus(ctx, r.Client, &arg, func() {
+		changed = setCondition(&arg.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, arg.Generation)
+		changed = changed || arg.Status.ObservedGeneration != arg.Generation || arg.Status.BackendNamespace != backendNS
+		arg.Status.ObservedGeneration = arg.Generation
+		arg.Status.BackendNamespace = backendNS
+	}, &changed)
+	return ctrl.Result{}, err
+}
+
+// validateRuleGroups checks durations for all backends and PromQL syntax for Mimir.
+// LogQL is validated by Loki itself at sync time.
+func validateRuleGroups(be v1alpha1.Backend, groups []v1alpha1.RuleGroup) error {
+	for _, g := range groups {
+		if g.Interval != "" {
+			if _, err := model.ParseDuration(g.Interval); err != nil {
+				return fmt.Errorf("group %s: interval: %w", g.Name, err)
+			}
+		}
+		for i, rule := range g.Rules {
+			if rule.For != "" {
+				if _, err := model.ParseDuration(rule.For); err != nil {
+					return fmt.Errorf("group %s rule %d: for: %w", g.Name, i, err)
+				}
+			}
+			if rule.KeepFiringFor != "" {
+				if _, err := model.ParseDuration(rule.KeepFiringFor); err != nil {
+					return fmt.Errorf("group %s rule %d: keep_firing_for: %w", g.Name, i, err)
+				}
+			}
+			if be == v1alpha1.BackendMimir {
+				if err := compile.ValidatePromQL(rule.Expr); err != nil {
+					return fmt.Errorf("group %s rule %d: expr: %w", g.Name, i, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// tenantToRuleGroups re-enqueues every AlertRuleGroup that references a changed Tenant.
+func (r *AlertRuleGroupReconciler) tenantToRuleGroups(ctx context.Context, o client.Object) []reconcile.Request {
+	var list v1alpha1.AlertRuleGroupList
+	if err := r.List(ctx, &list, client.MatchingFields{index.IndexTenantRef: o.GetName()}); err != nil {
+		return nil
+	}
+	out := make([]reconcile.Request, 0, len(list.Items))
+	for _, item := range list.Items {
+		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&item)})
+	}
+	return out
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AlertRuleGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&observabilityv1alpha1.AlertRuleGroup{}).
+		For(&v1alpha1.AlertRuleGroup{}).
+		Watches(&v1alpha1.Tenant{}, handler.EnqueueRequestsFromMapFunc(r.tenantToRuleGroups)).
 		Named("alertrulegroup").
 		Complete(r)
 }

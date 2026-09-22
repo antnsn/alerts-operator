@@ -8,6 +8,24 @@ rules:
   - observability.antnsn.dev
   resources:
   - alertrulegroups
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - observability.antnsn.dev
+  resources:
+  - alertrulegroups/status
+  - contactpoints/status
+  - notificationpolicies/status
+  - tenants/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - observability.antnsn.dev
+  resources:
   - contactpoints
   - notificationpolicies
   - tenants
@@ -22,20 +40,8 @@ rules:
 - apiGroups:
   - observability.antnsn.dev
   resources:
-  - alertrulegroups/finalizers
   - contactpoints/finalizers
   - notificationpolicies/finalizers
   - tenants/finalizers
   verbs:
-  - update
-- apiGroups:
-  - observability.antnsn.dev
-  resources:
-  - alertrulegroups/status
-  - contactpoints/status
-  - notificationpolicies/status
-  - tenants/status
-  verbs:
-  - get
-  - patch
   - update

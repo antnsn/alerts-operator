@@ -98,7 +98,10 @@ func TestMain(m *testing.M) {
 }
 
 // setupReconcilers is extended task by task as reconcilers appear.
-func setupReconcilers(mgr ctrl.Manager) error { //nolint:revive // mgr will be used once reconcilers are registered here in later tasks
+func setupReconcilers(mgr ctrl.Manager) error {
+	if err := (&AlertRuleGroupReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	return nil
 }
 
