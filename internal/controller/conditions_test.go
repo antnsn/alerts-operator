@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +25,51 @@ func TestSetConditionReportsChange(t *testing.T) {
 	}
 	if conds[0].ObservedGeneration != 2 || conds[0].Message != "x" {
 		t.Fatalf("condition not updated: %+v", conds[0])
+	}
+}
+
+// TestSetConditionTruncatesMessage guards against metav1.Condition's Message MaxLength=32768
+// (enforced by the generated CRD schema): callers' spec fields (e.g. AlertRuleGroup's
+// tenantRef or a rule's expr) have no MaxLength of their own, and some backend/parser errors
+// echo the offending input back verbatim, so an oversized message could otherwise produce a
+// status patch the API server rejects, leaving the condition never recorded. setCondition
+// truncates centrally so every reconciler is protected, not just the ones that remember to.
+func TestSetConditionTruncatesMessage(t *testing.T) {
+	var conds []metav1.Condition
+	long := strings.Repeat("x", maxConditionMessage+1000)
+	if !setCondition(&conds, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalidRule, long, 1) {
+		t.Fatal("first set should report change")
+	}
+	if len(conds[0].Message) > maxConditionMessage {
+		t.Fatalf("condition message length %d exceeds max %d", len(conds[0].Message), maxConditionMessage)
+	}
+	if !strings.HasSuffix(conds[0].Message, "… [truncated]") {
+		t.Fatalf("truncated message should carry a marker suffix, got tail %q", conds[0].Message[len(conds[0].Message)-30:])
+	}
+
+	short := "group g rule 0: expr: parse error"
+	if !setCondition(&conds, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalidRule, short, 2) {
+		t.Fatal("message change should report change")
+	}
+	if conds[0].Message != short {
+		t.Fatalf("short message should pass through unchanged, got %q", conds[0].Message)
+	}
+}
+
+// TestTruncateMessage covers the helper directly, in addition to TestSetConditionTruncatesMessage
+// exercising it through setCondition.
+func TestTruncateMessage(t *testing.T) {
+	short := "group g rule 0: expr: parse error"
+	if got := truncateMessage(short); got != short {
+		t.Fatalf("short message should be unchanged, got %q", got)
+	}
+	long := strings.Repeat("x", maxConditionMessage+1000)
+	got := truncateMessage(long)
+	if len(got) > maxConditionMessage {
+		t.Fatalf("truncated message length %d exceeds max %d", len(got), maxConditionMessage)
+	}
+	if !strings.HasSuffix(got, "… [truncated]") {
+		t.Fatalf("truncated message should carry a marker suffix, got tail %q", got[len(got)-30:])
 	}
 }
 

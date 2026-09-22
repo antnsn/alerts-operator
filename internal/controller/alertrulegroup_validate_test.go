@@ -30,22 +30,3 @@ func TestValidateRuleGroups(t *testing.T) {
 		t.Fatalf("bad interval: %v", err)
 	}
 }
-
-// TestTruncateMessage guards against metav1.Condition's Message MaxLength=32768 (enforced by
-// the generated CRD schema): spec fields like tenantRef and rule expr have no MaxLength of
-// their own, so a large invalid value can otherwise produce a status patch the API server
-// rejects, leaving Accepted never recorded.
-func TestTruncateMessage(t *testing.T) {
-	short := "group g rule 0: expr: parse error"
-	if got := truncateMessage(short); got != short {
-		t.Fatalf("short message should be unchanged, got %q", got)
-	}
-	long := strings.Repeat("x", maxConditionMessage+1000)
-	got := truncateMessage(long)
-	if len(got) > maxConditionMessage {
-		t.Fatalf("truncated message length %d exceeds max %d", len(got), maxConditionMessage)
-	}
-	if !strings.HasSuffix(got, "...(truncated)") {
-		t.Fatalf("truncated message should carry a marker suffix, got tail %q", got[len(got)-20:])
-	}
-}

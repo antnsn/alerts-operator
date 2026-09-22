@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"unicode/utf8"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,10 +14,34 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
-// setCondition upserts a condition and reports whether anything changed.
+// maxConditionMessage matches metav1.Condition's Message MaxLength (32768), enforced by the
+// generated CRD schema, minus headroom for the truncation marker. Spec fields such as
+// tenantRef or a rule's expr/interval/for/keep_firing_for have no MaxLength of their own, and
+// some backend/parser errors echo the offending input back verbatim, so an oversized value
+// could otherwise produce a status patch the API server rejects -- leaving the condition never
+// recorded and the object stuck retrying the same failing patch forever. Bounding it centrally
+// in setCondition protects every reconciler, not just the ones that remember to do it locally.
+const maxConditionMessage = 32768 - 256
+
+// truncateMessage bounds msg to fit metav1.Condition's Message field, truncating on a UTF-8
+// rune boundary so the result is always valid.
+func truncateMessage(msg string) string {
+	if len(msg) <= maxConditionMessage {
+		return msg
+	}
+	const suffix = "… [truncated]"
+	cut := maxConditionMessage - len(suffix)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + suffix
+}
+
+// setCondition upserts a condition and reports whether anything changed. msg is truncated to
+// fit metav1.Condition's Message MaxLength before being recorded.
 func setCondition(conds *[]metav1.Condition, typ string, status metav1.ConditionStatus, reason, msg string, gen int64) bool {
 	return meta.SetStatusCondition(conds, metav1.Condition{
-		Type: typ, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen,
+		Type: typ, Status: status, Reason: reason, Message: truncateMessage(msg), ObservedGeneration: gen,
 	})
 }
 
