@@ -121,6 +121,14 @@ type TenantStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	AlertmanagerConfigHash string `json:"alertmanagerConfigHash,omitempty"`
+	// AlertmanagerConfigAddress is the spec.mimir.address AlertmanagerConfigHash was last confirmed
+	// against. spec.mimir.address is mutable (repointing at a moved gateway is legitimate
+	// operations), so a hash confirmed against a since-abandoned address is not evidence that this
+	// Tenant ever wrote anything at its *current* address -- the finalizer (which must never delete a
+	// document it cannot prove it wrote) compares this field against the current address before
+	// trusting AlertmanagerConfigHash at all.
+	// +optional
+	AlertmanagerConfigAddress string `json:"alertmanagerConfigAddress,omitempty"`
 	// +optional
 	RuleGroups RuleGroupCounts `json:"ruleGroups,omitempty"`
 }

@@ -1,13 +1,16 @@
 package controller
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -62,6 +65,18 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 	}
 }
 
+// writingContactPointAndPolicy returns a ContactPoint+NotificationPolicy pair that makes tenantRef's
+// Tenant actually compile and push an Alertmanager document (i.e. get a non-empty
+// status.alertmanagerConfigHash), for tests that need a real *writing* Tenant rather than merely a
+// Tenant with spec.mimir set. Names are suffixed so multiple pairs can coexist in one test.
+func writingContactPointAndPolicy(tenantRef, suffix string) (*observabilityv1alpha1.ContactPoint, *observabilityv1alpha1.NotificationPolicy) {
+	cp := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "fin-cp-" + suffix, Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tenantRef, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://" + suffix}}}}
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "fin-pol-" + suffix, Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: tenantRef, Route: observabilityv1alpha1.Route{Receiver: "fin-cp-" + suffix}}}
+	return cp, pol
+}
+
 // TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes covers a Codex P1 finding on this task:
 // conflictingTenant's ownership key includes the effective rules namespace prefix, which is correct
 // for rule namespaces but wrong for the Alertmanager document -- POST/GET/DELETE /api/v1/alerts is
@@ -69,10 +84,18 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 // tenantId+address but using different prefixes therefore share one live Alertmanager config even
 // though conflictingTenant(mimir) reports no conflict between them (their rule namespaces genuinely
 // don't collide). Deleting one must not wipe the other's shared, live config.
+//
+// Both Tenants here actually write their own Alertmanager document (real ContactPoint +
+// NotificationPolicy each), not just have spec.mimir set: after the P2-1/P2-2 fix (task-20 review
+// round 1), a Tenant that never wrote an Alertmanager document never attempts to delete one and is
+// never counted as a valid claimant to defer to (see TestTenantFinalizerLeavesNeverWrittenAlertmanagerConfig
+// and TestTenantFinalizerDeletesOwnAlertmanagerDespiteNonWritingClaimant). Without both Tenants here
+// being real writers, this test would pass for the wrong reason -- dying's own P2-1 gate would skip
+// the delete attempt before ever reaching the prefix-independent ownership check this test exists to
+// cover.
 func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	srv := fake.New()
 	defer srv.Close()
-	srv.SetAlertmanager("1", &backend.AlertmanagerConfig{Config: "route:\n  receiver: x\nreceivers:\n- name: x\n"})
 
 	// Deleted inline at the end of the test body, not via t.Cleanup: t.Cleanup callbacks run after
 	// the test function returns, which is *after* the defer above has already closed srv (Go runs a
@@ -84,18 +107,31 @@ func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	if err := testClient.Create(testCtx, survivor); err != nil {
 		t.Fatal(err)
 	}
+	survivorCP, survivorPol := writingContactPointAndPolicy(survivor.Name, "survivor")
+	if err := testClient.Create(testCtx, survivorCP); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Create(testCtx, survivorPol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, survivor, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
 
 	dying := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-dying"},
 		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "prefix-a"}}
 	if err := testClient.Create(testCtx, dying); err != nil {
 		t.Fatal(err)
 	}
-	// Wait for the finalizer to actually land before deleting, so Delete can't race the very first
-	// reconcile (AddFinalizer) and remove the object before finalize ever runs.
-	waitFor(t, func() bool {
-		_ = testClient.Get(testCtx, clientKey(dying), dying)
-		return controllerutil.ContainsFinalizer(dying, tenantFinalizer)
-	})
+	dyingCP, dyingPol := writingContactPointAndPolicy(dying.Name, "dying")
+	if err := testClient.Create(testCtx, dyingCP); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Create(testCtx, dyingPol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, dying, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	if dying.Status.AlertmanagerConfigHash == "" {
+		t.Fatal("precondition: dying never wrote an alertmanager document")
+	}
 
 	if err := testClient.Delete(testCtx, dying); err != nil {
 		t.Fatal(err)
@@ -107,6 +143,224 @@ func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 		t.Fatal("shared alertmanager config wrongly deleted by the colliding Tenant's finalizer")
 	}
 
+	for _, o := range []client.Object{dyingCP, dyingPol, survivorCP, survivorPol} {
+		_ = testClient.Delete(testCtx, o)
+	}
+	if err := testClient.Delete(testCtx, survivor); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(survivor), &observabilityv1alpha1.Tenant{}))
+	})
+}
+
+// TestTenantFinalizerLeavesNeverWrittenAlertmanagerConfig covers Codex P2-1 (task-20 review round 1):
+// finalize used to issue DELETE /api/v1/alerts whenever spec.mimir was set, with no check that this
+// operator ever wrote that document -- so a rules-only Tenant (no accepted NotificationPolicy, which
+// is precisely when syncAlertmanager never touches the backend at all, see tenant_alertmanager.go's
+// ch.Policy==nil early return) would destroy a hand-written or externally-managed Alertmanager
+// config on delete, despite the steady-state sync having correctly left it alone the whole time it
+// was reconciling. Guard: only delete when tenant.Status.AlertmanagerConfigHash != "".
+func TestTenantFinalizerLeavesNeverWrittenAlertmanagerConfig(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+	const handWritten = "route:\n  receiver: hand-written\nreceivers:\n- name: hand-written\n"
+	srv.SetAlertmanager("1", &backend.AlertmanagerConfig{Config: handWritten})
+
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-neverwrote"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "fin-neverwrote"}}
+	if err := testClient.Create(testCtx, tn); err != nil {
+		t.Fatal(err)
+	}
+	// No ContactPoint/NotificationPolicy is ever created for this Tenant: it manages rules only.
+	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, observabilityv1alpha1.ReasonNoNotificationPolicy)
+	if tn.Status.AlertmanagerConfigHash != "" {
+		t.Fatal("precondition: tenant must never have written an alertmanager document")
+	}
+	if got := srv.Alertmanager("1"); got == nil || got.Config != handWritten {
+		t.Fatalf("precondition: hand-written config not intact before delete: %+v", got)
+	}
+
+	if err := testClient.Delete(testCtx, tn); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(tn), &observabilityv1alpha1.Tenant{}))
+	})
+	if got := srv.Alertmanager("1"); got == nil || got.Config != handWritten {
+		t.Fatalf("finalizer deleted an alertmanager config this operator never wrote: %+v", got)
+	}
+}
+
+// TestTenantFinalizerDeletesOwnAlertmanagerDespiteNonWritingClaimant covers Codex P2-2 (task-20
+// review round 1): finalizeOwner used to defer AM cleanup to *any* live claimant sharing
+// tenantId+address, including one that never writes the Alertmanager document at all (no accepted
+// NotificationPolicy). That strands the writer's config forever: the non-writing claimant will never
+// overwrite or delete it, and the writer's own CR is gone. Guard: only a claimant with a non-empty
+// status.alertmanagerConfigHash counts as a valid claimant to defer to; a writer with no valid
+// claimant must delete its own document rather than leave it stranded.
+func TestTenantFinalizerDeletesOwnAlertmanagerDespiteNonWritingClaimant(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+
+	writer := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-writer"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "fin-writer-prefix"}}
+	if err := testClient.Create(testCtx, writer); err != nil {
+		t.Fatal(err)
+	}
+	cp, pol := writingContactPointAndPolicy(writer.Name, "writer")
+	if err := testClient.Create(testCtx, cp); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Create(testCtx, pol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, writer, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	if writer.Status.AlertmanagerConfigHash == "" || srv.Alertmanager("1") == nil {
+		t.Fatal("precondition: writer never wrote an alertmanager document")
+	}
+
+	nonwriter := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-nonwriter"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "fin-nonwriter-prefix"}}
+	if err := testClient.Create(testCtx, nonwriter); err != nil {
+		t.Fatal(err)
+	}
+	// No ContactPoint/NotificationPolicy for nonwriter: it never writes the Alertmanager document.
+	waitCondition(t, nonwriter, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, observabilityv1alpha1.ReasonNoNotificationPolicy)
+	if nonwriter.Status.AlertmanagerConfigHash != "" {
+		t.Fatal("precondition: nonwriter must never have written an alertmanager document")
+	}
+
+	if err := testClient.Delete(testCtx, writer); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(writer), &observabilityv1alpha1.Tenant{}))
+	})
+	if srv.Alertmanager("1") != nil {
+		t.Fatal("writer's alertmanager config stranded: deferred to a claimant that never wrote it")
+	}
+
+	for _, o := range []client.Object{cp, pol} {
+		_ = testClient.Delete(testCtx, o)
+	}
+	if err := testClient.Delete(testCtx, nonwriter); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(nonwriter), &observabilityv1alpha1.Tenant{}))
+	})
+}
+
+// TestTenantFinalizerSkipsMimirRuleNamespacesSharedWithLiveClaimant covers Codex P3-2 (task-20 review
+// round 1): the rule-namespace ownership guard (finalizeOwner over claimants(..., withPrefix=true))
+// had no regression test on either backend -- deleting the guard from both call sites left the whole
+// suite green. Two Tenants sharing tenantId+address+prefix collide on rule namespaces, the exact
+// scenario conflictingTenant exists to guard in the steady-state prune; deleting one must not remove
+// the survivor's live Mimir rule namespace.
+func TestTenantFinalizerSkipsMimirRuleNamespacesSharedWithLiveClaimant(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+	const collidePrefix = "fin-mrule-collide"
+	const survivorNS = collidePrefix + "/default/keep-m"
+
+	survivor := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-mrule-survivor"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: collidePrefix}}
+	if err := testClient.Create(testCtx, survivor); err != nil {
+		t.Fatal(err)
+	}
+	survivorGroup := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "keep-m", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: survivor.Name, Backend: "mimir", Groups: []observabilityv1alpha1.RuleGroup{
+			{Name: "g1", Rules: []observabilityv1alpha1.Rule{{Alert: "A", Expr: "up == 0"}}},
+		}}}
+	if err := testClient.Create(testCtx, survivorGroup); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, survivor, observabilityv1alpha1.ConditionMimirRulesSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	if len(srv.Rules("1")[survivorNS]) != 1 {
+		t.Fatalf("precondition: survivor namespace not populated, got %+v", srv.Rules("1"))
+	}
+
+	dying := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-mrule-dying"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: collidePrefix}}
+	if err := testClient.Create(testCtx, dying); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_ = testClient.Get(testCtx, clientKey(dying), dying)
+		return controllerutil.ContainsFinalizer(dying, tenantFinalizer)
+	})
+
+	if err := testClient.Delete(testCtx, dying); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(dying), &observabilityv1alpha1.Tenant{}))
+	})
+	if len(srv.Rules("1")[survivorNS]) != 1 {
+		t.Fatal("survivor's mimir rule namespace wrongly deleted by the colliding Tenant's finalizer")
+	}
+
+	if err := testClient.Delete(testCtx, survivorGroup); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Delete(testCtx, survivor); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(survivor), &observabilityv1alpha1.Tenant{}))
+	})
+}
+
+// TestTenantFinalizerSkipsLokiRuleNamespacesSharedWithLiveClaimant is
+// TestTenantFinalizerSkipsMimirRuleNamespacesSharedWithLiveClaimant's Loki counterpart -- the P3-2
+// finding explicitly calls out both backends, and the ownership guard is applied independently per
+// backend (deleteOwnedNamespaces is called separately for Mimir and Loki), so covering one backend
+// says nothing about the other.
+func TestTenantFinalizerSkipsLokiRuleNamespacesSharedWithLiveClaimant(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+	const collidePrefix = "fin-lrule-collide"
+	const survivorNS = collidePrefix + "/default/keep-l"
+
+	survivor := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-lrule-survivor"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Loki: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: collidePrefix}}
+	if err := testClient.Create(testCtx, survivor); err != nil {
+		t.Fatal(err)
+	}
+	survivorGroup := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "keep-l", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: survivor.Name, Backend: "loki", Groups: ruleGroups(`{a="b"}`)}}
+	if err := testClient.Create(testCtx, survivorGroup); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, survivor, observabilityv1alpha1.ConditionLokiRulesSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	if len(srv.LokiRules("1")[survivorNS]) != 1 {
+		t.Fatalf("precondition: survivor namespace not populated, got %+v", srv.LokiRules("1"))
+	}
+
+	dying := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-lrule-dying"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Loki: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: collidePrefix}}
+	if err := testClient.Create(testCtx, dying); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_ = testClient.Get(testCtx, clientKey(dying), dying)
+		return controllerutil.ContainsFinalizer(dying, tenantFinalizer)
+	})
+
+	if err := testClient.Delete(testCtx, dying); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(dying), &observabilityv1alpha1.Tenant{}))
+	})
+	if len(srv.LokiRules("1")[survivorNS]) != 1 {
+		t.Fatal("survivor's loki rule namespace wrongly deleted by the colliding Tenant's finalizer")
+	}
+
+	if err := testClient.Delete(testCtx, survivorGroup); err != nil {
+		t.Fatal(err)
+	}
 	if err := testClient.Delete(testCtx, survivor); err != nil {
 		t.Fatal(err)
 	}
@@ -184,5 +438,109 @@ func TestTenantReconcilerSetupWithManagerSetsUncachedAPIReader(t *testing.T) {
 	}
 	if r.APIReader == nil {
 		t.Fatal("SetupWithManager must set APIReader to an uncached reader")
+	}
+}
+
+// TestTenantFinalizerDeletesAlertmanagerAfterNotificationPolicyRemoved answers a question the task-20
+// review asked directly: once a Tenant has written an Alertmanager document and then has its
+// NotificationPolicy removed, what does the P2-1 gate (tenant.Status.AlertmanagerConfigHash != "")
+// see, and does cleanup still happen correctly?
+//
+// AlertmanagerConfigHash is set exactly once, on syncAlertmanager's success path
+// (tenant_alertmanager.go:127), and is never cleared anywhere in the codebase -- grepped: the only
+// other reference is the cache-recency check that reads it, never resets it. Once a NotificationPolicy
+// is removed, ch.Policy == nil short-circuits syncAlertmanager before it touches the backend or the
+// hash at all (the ReasonNoNotificationPolicy branch), so the hash is left exactly as it was: stale
+// (it no longer reflects "what would be compiled today"), but still a true record that this Tenant,
+// and no one else, authored what is currently live in Mimir (single-writer model: only this
+// Tenant's own reconciler was ever a candidate to have overwritten it since). So the gate still reads
+// non-empty and the finalizer still deletes it -- correctly, because the document sitting in Mimir is
+// still this Tenant's document, not a hand-written or third-party one; only its policy went away, not
+// its ownership of what it already pushed.
+func TestTenantFinalizerDeletesAlertmanagerAfterNotificationPolicyRemoved(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-policyremoved"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: "fin-policyremoved"}}
+	if err := testClient.Create(testCtx, tn); err != nil {
+		t.Fatal(err)
+	}
+	cp, pol := writingContactPointAndPolicy(tn.Name, "policyremoved")
+	if err := testClient.Create(testCtx, cp); err != nil {
+		t.Fatal(err)
+	}
+	if err := testClient.Create(testCtx, pol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	writtenHash := tn.Status.AlertmanagerConfigHash
+	if writtenHash == "" || srv.Alertmanager("1") == nil {
+		t.Fatal("precondition: tenant never wrote an alertmanager document")
+	}
+
+	// Remove the NotificationPolicy: the next reconcile takes syncAlertmanager's ch.Policy==nil
+	// early return and never touches the backend or the hash again.
+	if err := testClient.Delete(testCtx, pol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, observabilityv1alpha1.ReasonNoNotificationPolicy)
+	if tn.Status.AlertmanagerConfigHash != writtenHash {
+		t.Fatalf("hash changed after policy removal: got %q, want unchanged %q", tn.Status.AlertmanagerConfigHash, writtenHash)
+	}
+	if srv.Alertmanager("1") == nil {
+		t.Fatal("alertmanager document unexpectedly disappeared from the backend after policy removal")
+	}
+
+	if err := testClient.Delete(testCtx, tn); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return errors.IsNotFound(testClient.Get(testCtx, clientKey(tn), &observabilityv1alpha1.Tenant{}))
+	})
+	if srv.Alertmanager("1") != nil {
+		t.Fatal("finalizer failed to delete the tenant's own (stale but genuinely authored) alertmanager document")
+	}
+
+	_ = testClient.Delete(testCtx, cp)
+}
+
+// TestTenantFinalizerDoesNotDeleteAlertmanagerAfterAddressRepointedWithoutResync covers a Codex P1
+// finding on the fix-round-1 (P2-1/P2-2) change: spec.mimir.address is mutable (repointing at a moved
+// gateway is legitimate operations, tenant_types.go), but status.AlertmanagerConfigHash alone carries
+// no record of *which* address it was confirmed against. If a Tenant successfully writes to address A
+// (hash set), is then repointed to address B, and syncAlertmanager has not yet (or cannot) confirm a
+// write to B, the hash is still non-empty -- stale evidence from A, not B. Without binding the hash to
+// an address, deleting this Tenant would attempt to delete whatever document happens to live at the
+// *new* address B, which this Tenant never wrote.
+//
+// Driven directly against finalize() with a fake client + a real fake Mimir server for B, not through
+// the full envtest reconcile loop: reproducing "syncAlertmanager attempted and failed to confirm
+// against B" deterministically through real reconciliation would depend on timing the manager's watch
+// against a live resync, which is inherently racy. Status is set directly to the exact state the race
+// would produce (hash confirmed, but AlertmanagerConfigAddress still recording the old address A) and
+// finalize is called once, matching the pattern used elsewhere in this package for isolated Reconcile
+// behavior (see TestTenantReadyOnFirstReconcileFallsBackToPending in tenant_controller_test.go).
+func TestTenantFinalizerDoesNotDeleteAlertmanagerAfterAddressRepointedWithoutResync(t *testing.T) {
+	srvB := fake.New()
+	defer srvB.Close()
+	const foreign = "route:\n  receiver: foreign\nreceivers:\n- name: foreign\n"
+	srvB.SetAlertmanager("1", &backend.AlertmanagerConfig{Config: foreign})
+
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "fin-am-repointed"},
+		Spec:       observabilityv1alpha1.TenantSpec{TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srvB.URL}},
+		Status: observabilityv1alpha1.TenantStatus{
+			// Confirmed once against a since-abandoned address A -- never against srvB (current).
+			AlertmanagerConfigHash:    "sha256:stale-from-address-a",
+			AlertmanagerConfigAddress: "http://address-a.invalid",
+		},
+	}
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, tn), Recorder: record.NewFakeRecorder(20)}
+	if err := r.finalize(context.Background(), tn); err != nil {
+		t.Fatal(err)
+	}
+	if got := srvB.Alertmanager("1"); got == nil || got.Config != foreign {
+		t.Fatalf("finalizer deleted a foreign alertmanager config at the new address using a hash confirmed only against the old one: %+v", got)
 	}
 }

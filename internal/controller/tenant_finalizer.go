@@ -50,16 +50,37 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 
 		// DELETE /api/v1/alerts wipes this tenant's whole Alertmanager config in Mimir. It is
 		// permitted here, in the finalizer, and nowhere else in this codebase.
-		amClaimants, err := r.claimants(ctx, tenant, v1alpha1.BackendMimir, false)
-		if err != nil {
-			return fmt.Errorf("mimir: cannot verify alertmanager ownership: %w", err)
-		}
-		if owner := finalizeOwner(tenant, amClaimants); owner != "" {
-			r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "FinalizeSkipped",
-				"mimir: Tenant %q shares tenantId %q and address %s; alertmanager config left untouched for it to reconcile",
-				owner, tenant.Spec.TenantID, backendAddress(tenant, v1alpha1.BackendMimir))
-		} else if err := mc.Delete(ctx); err != nil {
-			return fmt.Errorf("delete alertmanager config: %w", err)
+		//
+		// Only attempted when this Tenant actually wrote the document that is currently live at its
+		// *current* address. status.alertmanagerConfigHash is set only once syncAlertmanager has
+		// confirmed the backend holds its compiled config (tenant_alertmanager.go): a Tenant with
+		// spec.mimir set but no accepted NotificationPolicy never calls store.Set at all (ch.Policy ==
+		// nil short-circuits before any backend I/O), so it has nothing of its own to delete --
+		// unconditionally deleting here could destroy a hand-written or externally-managed document
+		// this operator never claimed by writing (Codex P2-1, task-20 review round 1). The address
+		// comparison closes a second gap found reviewing that same fix (Codex P1, fix round 1):
+		// spec.mimir.address is mutable, so a non-empty hash confirmed against an address this Tenant
+		// has since been repointed away from is not evidence about the document at its current one --
+		// without this check, a stale hash from an old address would still pass the "did I write
+		// something" gate and let this Tenant delete whatever happens to live at its new address.
+		addr := backendAddress(tenant, v1alpha1.BackendMimir)
+		if tenant.Status.AlertmanagerConfigHash != "" && tenant.Status.AlertmanagerConfigAddress == addr {
+			amClaimants, err := r.claimants(ctx, tenant, v1alpha1.BackendMimir, false)
+			if err != nil {
+				return fmt.Errorf("mimir: cannot verify alertmanager ownership: %w", err)
+			}
+			// Only a claimant that itself wrote a document *at this same address* is a valid Tenant to
+			// defer to: one that never writes (no accepted NotificationPolicy), or whose own hash is
+			// stale from a different address, will never assert, overwrite, or delete this Tenant's
+			// document either, so deferring to it strands the config forever with no CR left
+			// describing it (Codex P2-2, task-20 review round 1).
+			if owner := finalizeOwner(tenant, writingClaimants(amClaimants, addr)); owner != "" {
+				r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "FinalizeSkipped",
+					"mimir: Tenant %q shares tenantId %q and address %s; alertmanager config left untouched for it to reconcile",
+					owner, tenant.Spec.TenantID, addr)
+			} else if err := mc.Delete(ctx); err != nil {
+				return fmt.Errorf("delete alertmanager config: %w", err)
+			}
 		}
 
 		ruleClaimants, err := r.claimants(ctx, tenant, v1alpha1.BackendMimir, true)
@@ -133,6 +154,27 @@ func (r *TenantReconciler) claimants(ctx context.Context, tenant *v1alpha1.Tenan
 		out = append(out, *other)
 	}
 	return out, nil
+}
+
+// writingClaimants filters claimants to those that have themselves written an Alertmanager document
+// *at addr* -- the address this Tenant and every claimant in the slice share (claimants(...,
+// withPrefix=false) already filtered on it, so passing it again here is just reusing that same
+// value, not a new comparison basis). Sharing tenantId+address only guarantees a claimant can *read*
+// the document; only a claimant whose own AlertmanagerConfigHash was confirmed *at this address* will
+// ever assert, overwrite, or delete it there, so only those are valid Tenants to defer Alertmanager
+// cleanup to (Codex P2-2, task-20 review round 1). The address check additionally excludes a claimant
+// whose hash is non-empty but stale from an address it has since been repointed away from -- the same
+// gap fixed for this Tenant's own gate (Codex P1, fix round 1). Not used for rule-namespace claimants:
+// a rule claimant's ownership is established by sharing the prefix itself, so any such claimant's own
+// prune loop reclaims the residue once it stops seeing this Tenant as a conflict.
+func writingClaimants(claimants []v1alpha1.Tenant, addr string) []v1alpha1.Tenant {
+	var out []v1alpha1.Tenant
+	for _, c := range claimants {
+		if c.Status.AlertmanagerConfigHash != "" && c.Status.AlertmanagerConfigAddress == addr {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // finalizeOwner decides, among tenant and its claimants for one backend target, which single Tenant

@@ -125,6 +125,12 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 		}
 	}
 	tenant.Status.AlertmanagerConfigHash = hash
+	// Recorded together with the hash, in the same in-memory mutation that Reconcile patches as one
+	// unit: the finalizer (tenant_finalizer.go) trusts AlertmanagerConfigHash as evidence this Tenant
+	// wrote the document only when this address still matches spec.mimir.address at delete time --
+	// spec.mimir.address is mutable, so a hash confirmed against an address this Tenant has since
+	// moved off of is not evidence about what (if anything) it wrote at the new one.
+	tenant.Status.AlertmanagerConfigAddress = backendAddress(tenant, v1alpha1.BackendMimir)
 	r.markSynced(tenant.Name, gen, auth)
 	metrics.Observe(tenant.Name, metrics.TargetAlertmanager, nil)
 	setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
