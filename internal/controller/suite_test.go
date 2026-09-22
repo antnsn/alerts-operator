@@ -99,6 +99,9 @@ func TestMain(m *testing.M) {
 
 // setupReconcilers is extended task by task as reconcilers appear.
 func setupReconcilers(mgr ctrl.Manager) error {
+	if err := (&TenantReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	if err := (&AlertRuleGroupReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
 		return err
 	}
@@ -112,8 +115,6 @@ func setupReconcilers(mgr ctrl.Manager) error {
 }
 
 // waitFor polls until cond returns true or 10s pass.
-//
-//nolint:unused // helper for controller tests added in later tasks
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)

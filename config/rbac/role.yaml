@@ -7,11 +7,19 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
   - secrets
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - observability.antnsn.dev
   resources:
@@ -38,8 +46,6 @@ rules:
   resources:
   - tenants
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
