@@ -1,0 +1,21 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: NotificationPolicy
+metadata:
+  name: homelab
+  namespace: monitoring
+spec:
+  tenantRef: homelab
+  route:
+    receiver: keep
+    groupBy: [alertname, namespace]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    routes:
+      - receiver: pushover
+        matchers: ['severity="critical"']
+        continue: true
+  inhibitRules:
+    - sourceMatchers: ['severity="critical"']
+      targetMatchers: ['severity="warning"']
+      equal: [alertname, namespace]

@@ -82,4 +82,11 @@ helm template x "$CHART" --namespace alerts-operator --include-crds --set servic
 assert_not '^kind: ServiceAccount$' "$OUT/customsa.yaml"
 assert_has 'serviceAccountName: custom-sa' "$OUT/customsa.yaml"
 
+# Examples must exist and parse as YAML; schema validation happens on the home cluster (docs/e2e.md).
+EX="$(cd "$(dirname "$0")/.." && pwd)/docs/examples"
+for f in tenant secrets contactpoints notificationpolicy alertrulegroup-mimir alertrulegroup-loki; do
+  [ -f "$EX/$f.yaml" ] || { echo "missing docs/examples/$f.yaml"; exit 1; }
+  yq e . "$EX/$f.yaml" >/dev/null
+done
+
 echo "chart-test: OK"

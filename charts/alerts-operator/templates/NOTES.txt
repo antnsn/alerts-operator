@@ -7,6 +7,14 @@ Next:
   3. Watch status:
        kubectl get tenants
        kubectl get contactpoints,notificationpolicies,alertrulegroups -A
+
+IMPORTANT — on every future upgrade of this chart:
+  `helm upgrade` never updates the CRDs in this chart's crds/ directory once they already exist
+  on the cluster (standard Helm behaviour). This project validates every CR with CEL rules baked
+  into the CRDs themselves (no admission webhooks), so an un-refreshed CRD after a schema/CEL
+  change means validation silently stops matching this build of the controller. Re-apply by hand
+  after every upgrade:
+       helm show crds antnsn/alerts-operator --version <new-version> | kubectl apply --server-side -f -
 {{- if .Values.metrics.enabled }}
 
 Metrics: http://{{ include "alerts-operator.metricsServiceName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.metrics.service.port }}/metrics

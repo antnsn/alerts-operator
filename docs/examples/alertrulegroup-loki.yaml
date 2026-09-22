@@ -1,0 +1,19 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: AlertRuleGroup
+metadata:
+  name: udm
+  namespace: monitoring
+spec:
+  tenantRef: homelab
+  backend: loki
+  groups:
+    - name: udm
+      interval: 1m
+      rules:
+        - alert: UDMErrorBurst
+          expr: sum(rate({host="udm"} |= "error" [5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "UDM logging errors at {{ $value }}/s"

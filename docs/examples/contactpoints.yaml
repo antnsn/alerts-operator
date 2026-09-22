@@ -1,0 +1,32 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: ContactPoint
+metadata:
+  name: keep
+  namespace: monitoring
+spec:
+  tenantRef: homelab
+  webhook:
+    - url: http://keep-backend.keep:8080/alerts/event/prometheus
+      httpConfig:
+        bearerTokenSecretRef:
+          name: keep
+          key: api-key
+      sendResolved: true
+---
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: ContactPoint
+metadata:
+  name: pushover
+  namespace: monitoring
+spec:
+  tenantRef: homelab
+  pushover:
+    - userKeySecretRef:
+        name: pushover
+        key: user
+      tokenSecretRef:
+        name: pushover
+        key: token
+      priority: "1"
+      title: '{{ .CommonLabels.alertname }} ({{ .Status }})'
+      sendResolved: true

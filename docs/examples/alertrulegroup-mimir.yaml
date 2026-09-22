@@ -1,0 +1,21 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: AlertRuleGroup
+metadata:
+  name: homelab
+  namespace: monitoring
+spec:
+  tenantRef: homelab
+  backend: mimir
+  groups:
+    - name: node.health
+      interval: 1m
+      rules:
+        - alert: NodeDown
+          expr: up{job="node"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.instance }} is down"
+        - record: job:up:ratio
+          expr: avg by (job) (up)

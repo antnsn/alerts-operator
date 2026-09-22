@@ -1,0 +1,13 @@
+apiVersion: observability.antnsn.dev/v1alpha1
+kind: Tenant
+metadata:
+  name: homelab
+spec:
+  tenantId: "1"
+  mimir:
+    address: http://mimir-distributed-nginx.mimir:80
+  loki:
+    address: http://loki-gateway.loki
+  alertmanager: {}
+  rulesNamespacePrefix: alerts-operator
+  resyncInterval: 5m
