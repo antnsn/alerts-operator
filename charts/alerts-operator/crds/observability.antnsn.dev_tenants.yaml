@@ -1,0 +1,288 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: tenants.observability.antnsn.dev
+spec:
+  group: observability.antnsn.dev
+  names:
+    kind: Tenant
+    listKind: TenantList
+    plural: tenants
+    singular: tenant
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantId
+      name: Tenant
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Tenant is the Schema for the tenants API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: TenantSpec defines the desired state of Tenant.
+            properties:
+              alertmanager:
+                description: AlertmanagerSpec describes how to reach an Alertmanager
+                  instance.
+                properties:
+                  templatesRef:
+                    description: TemplatesRef points at a ConfigMap whose entries
+                      become Alertmanager template_files.
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                type: object
+              loki:
+                description: BackendSpec describes how to reach one Mimir or Loki
+                  instance.
+                properties:
+                  address:
+                    description: Address is the base URL of the backend gateway, e.g.
+                      http://mimir-distributed-nginx.mimir:80
+                    pattern: ^https?://
+                    type: string
+                  auth:
+                    description: BackendAuth describes authentication credentials
+                      for a backend.
+                    properties:
+                      basicAuthSecretRef:
+                        description: BasicAuthSecretRef points at a Secret with keys
+                          `username` and `password`.
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          namespace:
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    type: object
+                required:
+                - address
+                type: object
+              mimir:
+                description: BackendSpec describes how to reach one Mimir or Loki
+                  instance.
+                properties:
+                  address:
+                    description: Address is the base URL of the backend gateway, e.g.
+                      http://mimir-distributed-nginx.mimir:80
+                    pattern: ^https?://
+                    type: string
+                  auth:
+                    description: BackendAuth describes authentication credentials
+                      for a backend.
+                    properties:
+                      basicAuthSecretRef:
+                        description: BasicAuthSecretRef points at a Secret with keys
+                          `username` and `password`.
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          namespace:
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    type: object
+                required:
+                - address
+                type: object
+              resyncInterval:
+                description: ResyncInterval is the drift-repair period. Default 5m.
+                type: string
+              rulesNamespacePrefix:
+                default: alerts-operator
+                description: |-
+                  RulesNamespacePrefix scopes which backend rule namespaces this operator owns. Default "alerts-operator".
+                  Immutable: the Tenant reconciler only prunes backend rule namespaces it can positively confirm
+                  it owns under the *current* prefix, so changing this after creation would silently orphan every
+                  namespace already written under the old prefix (duplicate, un-pruned rules/alerts indefinitely).
+                  Defaulted (not left to Prefix()'s Go-side fallback alone) so the field is always materialised
+                  in the stored object: "self == oldSelf" is a transition rule and is not evaluated against a
+                  field that was absent on the old object, so an unset-then-set edit would otherwise bypass
+                  immutability entirely -- the field must actually be present from creation for oldSelf to exist.
+                pattern: ^[A-Za-z0-9_.-]+$
+                type: string
+                x-kubernetes-validations:
+                - message: rulesNamespacePrefix is immutable
+                  rule: self == oldSelf
+              tenantId:
+                description: |-
+                  TenantID is sent as X-Scope-OrgID on every backend request.
+                  Immutable, for the same reason as RulesNamespacePrefix below: tenantId, the backend address
+                  and the prefix are the three coordinates that decide which backend state this Tenant owns,
+                  and the reconciler only ever lists and prunes within the *current* ones. Changing tenantId
+                  leaves every rule namespace and the Alertmanager config live in the old org, where neither
+                  the prune loop nor the finalizer will ever look again -- duplicate, un-pruned rules/alerts
+                  indefinitely, not even recoverable by deleting the Tenant. (The addresses stay mutable:
+                  repointing at a moved gateway is legitimate operations, and the orphaning that can cause is
+                  documented rather than forbidden.) Unlike RulesNamespacePrefix this needs no default marker
+                  to make the transition rule bite -- the field is required, so oldSelf always exists.
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: tenantId is immutable
+                  rule: self == oldSelf
+            required:
+            - tenantId
+            type: object
+            x-kubernetes-validations:
+            - message: at least one of spec.mimir or spec.loki must be set
+              rule: has(self.mimir) || has(self.loki)
+            - message: spec.alertmanager requires spec.mimir
+              rule: '!has(self.alertmanager) || has(self.mimir)'
+          status:
+            description: TenantStatus defines the observed state of Tenant.
+            properties:
+              alertmanagerConfigAddress:
+                description: |-
+                  AlertmanagerConfigAddress is the spec.mimir.address AlertmanagerConfigHash was last confirmed
+                  against. spec.mimir.address is mutable (repointing at a moved gateway is legitimate
+                  operations), so a hash confirmed against a since-abandoned address is not evidence that this
+                  Tenant ever wrote anything at its *current* address -- the finalizer (which must never delete a
+                  document it cannot prove it wrote) compares this field against the current address before
+                  trusting AlertmanagerConfigHash at all.
+                type: string
+              alertmanagerConfigHash:
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
+              ruleGroups:
+                description: |-
+                  RuleGroupCounts tracks the number of rule groups per backend.
+
+                  Both fields carry +kubebuilder:default=0 despite being required: a status patch is a JSON merge
+                  patch built from a before/after diff (see patchStatus in internal/controller/conditions.go), so
+                  the very first time only one of Mimir/Loki moves off its Go zero value, the generated patch omits
+                  the untouched sibling entirely. Applied to a stored object that has never had a ruleGroups key at
+                  all, that produces a partial {mimir: 1} (or {loki: 1}) object missing its required sibling, which
+                  CRD structural-schema validation rejects -- permanently, since the same partial diff recurs every
+                  reconcile. The default lets the API server's structural-schema defaulting fill the missing sibling
+                  in before required-validation runs, so a partial patch still resolves to a valid object.
+                properties:
+                  loki:
+                    default: 0
+                    format: int32
+                    type: integer
+                  mimir:
+                    default: 0
+                    format: int32
+                    type: integer
+                required:
+                - loki
+                - mimir
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: spec.resyncInterval must be a valid Go duration (e.g. '5m', '1h30m')
+          rule: '!has(self.spec.resyncInterval) || self.spec.resyncInterval.matches(''^[0-9]+(ns|us|ms|s|m|h)([0-9]+(ns|us|ms|s|m|h))*$'')'
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -14,9 +14,4 @@ jobs:
         with: { version: v2.13.2 }
       - run: make test
       - uses: azure/setup-helm@v4
-      - run: |
-          if [ -d charts/alerts-operator ]; then
-            helm lint charts/alerts-operator
-          else
-            echo "no chart yet"
-          fi
+      - run: make chart-test

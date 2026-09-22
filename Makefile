@@ -152,6 +152,20 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
+##@ Helm
+
+CHART_DIR ?= charts/alerts-operator
+
+.PHONY: helm-sync-crds
+helm-sync-crds: manifests ## Copy generated CRDs into the Helm chart.
+	mkdir -p $(CHART_DIR)/crds
+	rm -f $(CHART_DIR)/crds/*.yaml
+	cp -f config/crd/bases/*.yaml $(CHART_DIR)/crds/
+
+.PHONY: chart-test
+chart-test: helm-sync-crds ## Lint and render the chart with assertions.
+	hack/chart-test.sh
+
 ##@ Deployment
 
 ifndef ignore-not-found

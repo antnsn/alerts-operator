@@ -1,0 +1,13 @@
+apiVersion: v2
+name: alerts-operator
+description: Kubernetes operator for Grafana Mimir / Loki alert rules and Mimir Alertmanager configuration
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/antnsn/alerts-operator
+sources:
+  - https://github.com/antnsn/alerts-operator
+keywords: [mimir, loki, alertmanager, alerting, operator]
+maintainers:
+  - name: antnsn
+    url: https://github.com/antnsn

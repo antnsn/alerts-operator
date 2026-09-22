@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "alerts-operator.fullname" . }}
+  labels:
+    {{- include "alerts-operator.labels" . | nindent 4 }}
+# Must stay identical to the "Appendix: RBAC rules" list at the end of the plan
+# (= config/rbac/role.yaml after `make manifests`). Children have no finalizers.
+rules:
+  - apiGroups: ["observability.antnsn.dev"]
+    resources: ["tenants"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["observability.antnsn.dev"]
+    resources: ["tenants/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["observability.antnsn.dev"]
+    resources: ["tenants/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["observability.antnsn.dev"]
+    resources: ["contactpoints", "notificationpolicies", "alertrulegroups"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["observability.antnsn.dev"]
+    resources: ["contactpoints/status", "notificationpolicies/status", "alertrulegroups/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
