@@ -186,7 +186,7 @@ func main() {
 	}
 
 	if err := index.Register(context.Background(), mgr); err != nil {
-		setupLog.Error(err, "unable to register field indexers")
+		setupLog.Error(err, "Unable to register field indexers")
 		os.Exit(1)
 	}
 
