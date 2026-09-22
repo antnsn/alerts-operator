@@ -67,7 +67,16 @@ type TenantSpec struct {
 	// +optional
 	Alertmanager *AlertmanagerSpec `json:"alertmanager,omitempty"`
 	// RulesNamespacePrefix scopes which backend rule namespaces this operator owns. Default "alerts-operator".
+	// Immutable: the Tenant reconciler only prunes backend rule namespaces it can positively confirm
+	// it owns under the *current* prefix, so changing this after creation would silently orphan every
+	// namespace already written under the old prefix (duplicate, un-pruned rules/alerts indefinitely).
+	// Defaulted (not left to Prefix()'s Go-side fallback alone) so the field is always materialised
+	// in the stored object: "self == oldSelf" is a transition rule and is not evaluated against a
+	// field that was absent on the old object, so an unset-then-set edit would otherwise bypass
+	// immutability entirely -- the field must actually be present from creation for oldSelf to exist.
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.-]+$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="rulesNamespacePrefix is immutable"
+	// +kubebuilder:default=alerts-operator
 	// +optional
 	RulesNamespacePrefix string `json:"rulesNamespacePrefix,omitempty"`
 	// ResyncInterval is the drift-repair period. Default 5m.
