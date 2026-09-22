@@ -18,46 +18,164 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"sort"
 
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/index"
 )
 
-// NotificationPolicyReconciler reconciles a NotificationPolicy object
+const maxRouteDepth = 10
+
+// NotificationPolicyReconciler validates the route tree, receiver references and per-tenant uniqueness.
 type NotificationPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=notificationpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=notificationpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=observability.antnsn.dev,resources=notificationpolicies/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=notificationpolicies/finalizers,verbs=update
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=contactpoints,verbs=get;list;watch
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=tenants,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the NotificationPolicy object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
-func (r *NotificationPolicyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+// Reconcile validates the NotificationPolicy's route tree, receiver references and per-tenant
+// uniqueness, then sets the Accepted condition.
+func (r *NotificationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var pol v1alpha1.NotificationPolicy
+	if err := r.Get(ctx, req.NamespacedName, &pol); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-	// TODO(user): your logic here
+	status, reason, msg, err := r.validate(ctx, &pol)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed := false
+	err = patchStatus(ctx, r.Client, &pol, func() {
+		changed = setCondition(&pol.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, pol.Generation)
+		changed = changed || pol.Status.ObservedGeneration != pol.Generation
+		pol.Status.ObservedGeneration = pol.Generation
+	}, &changed)
+	return ctrl.Result{}, err
+}
 
-	return ctrl.Result{}, nil
+// validate checks the referenced Tenant, the route tree depth and decode, every receiver
+// reference, and per-tenant uniqueness (oldest policy wins).
+func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alpha1.NotificationPolicy) (metav1.ConditionStatus, string, string, error) {
+	var tenant v1alpha1.Tenant
+	if err := r.Get(ctx, types.NamespacedName{Name: pol.Spec.TenantRef}, &tenant); errors.IsNotFound(err) {
+		return metav1.ConditionFalse, v1alpha1.ReasonTenantNotFound, fmt.Sprintf("Tenant %q not found", pol.Spec.TenantRef), nil
+	} else if err != nil {
+		return "", "", "", err
+	}
+	depth, err := routeDepth(&pol.Spec.Route)
+	if err != nil {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), nil
+	}
+	if depth > maxRouteDepth {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, fmt.Sprintf("route tree depth %d exceeds %d", depth, maxRouteDepth), nil
+	}
+	receivers, err := pol.Spec.Route.Receivers()
+	if err != nil {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error(), nil
+	}
+	for _, name := range receivers {
+		var cp v1alpha1.ContactPoint
+		err := r.Get(ctx, types.NamespacedName{Namespace: pol.Namespace, Name: name}, &cp)
+		if errors.IsNotFound(err) || (err == nil && cp.Spec.TenantRef != pol.Spec.TenantRef) {
+			return metav1.ConditionFalse, v1alpha1.ReasonContactPointNotFound,
+				fmt.Sprintf("receiver %q: no ContactPoint %s/%s for tenant %q", name, pol.Namespace, name, pol.Spec.TenantRef), nil
+		}
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	var all v1alpha1.NotificationPolicyList
+	if err := r.List(ctx, &all, client.MatchingFields{index.IndexTenantRef: pol.Spec.TenantRef}); err != nil {
+		return "", "", "", err
+	}
+	if w := policyWinner(all.Items); w != nil && (w.Namespace != pol.Namespace || w.Name != pol.Name) {
+		return metav1.ConditionFalse, v1alpha1.ReasonConflict,
+			fmt.Sprintf("Tenant %q already has NotificationPolicy %s/%s (oldest wins)", pol.Spec.TenantRef, w.Namespace, w.Name), nil
+	}
+	return metav1.ConditionTrue, v1alpha1.ReasonAccepted, "", nil
+}
+
+// routeDepth returns the depth of the route tree; a single root is 1. It decodes children via
+// ChildRoutes() and returns the first decode error, which the caller treats as Invalid.
+func routeDepth(r *v1alpha1.Route) (int, error) {
+	children, err := r.ChildRoutes()
+	if err != nil {
+		return 0, err
+	}
+	maxDepth := 0
+	for i := range children {
+		d, err := routeDepth(&children[i])
+		if err != nil {
+			return 0, err
+		}
+		if d > maxDepth {
+			maxDepth = d
+		}
+	}
+	return maxDepth + 1, nil
+}
+
+// policyWinner picks the one policy that counts for a tenant: oldest first, then "<ns>/<name>".
+func policyWinner(items []v1alpha1.NotificationPolicy) *v1alpha1.NotificationPolicy {
+	if len(items) == 0 {
+		return nil
+	}
+	sorted := make([]v1alpha1.NotificationPolicy, len(items))
+	copy(sorted, items)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ti, tj := sorted[i].CreationTimestamp.Time, sorted[j].CreationTimestamp.Time
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return sorted[i].Namespace+"/"+sorted[i].Name < sorted[j].Namespace+"/"+sorted[j].Name
+	})
+	return &sorted[0]
+}
+
+// policiesOfTenant enqueues all policies sharing a tenant (used for both Tenant and NotificationPolicy events).
+func (r *NotificationPolicyReconciler) policiesOfTenant(ctx context.Context, tenantName string) []reconcile.Request {
+	var list v1alpha1.NotificationPolicyList
+	if err := r.List(ctx, &list, client.MatchingFields{index.IndexTenantRef: tenantName}); err != nil {
+		return nil
+	}
+	return requestsFor(list.Items)
+}
+
+func (r *NotificationPolicyReconciler) contactPointToPolicies(ctx context.Context, o client.Object) []reconcile.Request {
+	var list v1alpha1.NotificationPolicyList
+	if err := r.List(ctx, &list, client.InNamespace(o.GetNamespace())); err != nil {
+		return nil
+	}
+	return requestsFor(list.Items)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NotificationPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&observabilityv1alpha1.NotificationPolicy{}).
+		For(&v1alpha1.NotificationPolicy{}).
+		// Siblings of the same tenant must re-evaluate the winner on any policy change (incl. delete).
+		Watches(&v1alpha1.NotificationPolicy{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
+			return r.policiesOfTenant(ctx, tenantRefOf(o))
+		})).
+		Watches(&v1alpha1.ContactPoint{}, handler.EnqueueRequestsFromMapFunc(r.contactPointToPolicies)).
+		Watches(&v1alpha1.Tenant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
+			return r.policiesOfTenant(ctx, o.GetName())
+		})).
 		Named("notificationpolicy").
 		Complete(r)
 }
