@@ -102,6 +102,9 @@ func setupReconcilers(mgr ctrl.Manager) error {
 	if err := (&AlertRuleGroupReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
 		return err
 	}
+	if err := (&ContactPointReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -122,11 +122,7 @@ func (r *AlertRuleGroupReconciler) tenantToRuleGroups(ctx context.Context, o cli
 	if err := r.List(ctx, &list, client.MatchingFields{index.IndexTenantRef: o.GetName()}); err != nil {
 		return nil
 	}
-	out := make([]reconcile.Request, 0, len(list.Items))
-	for _, item := range list.Items {
-		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&item)})
-	}
-	return out
+	return requestsFor(list.Items)
 }
 
 // SetupWithManager sets up the controller with the Manager.

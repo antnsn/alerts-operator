@@ -5,9 +5,18 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - observability.antnsn.dev
   resources:
   - alertrulegroups
+  - contactpoints
   verbs:
   - get
   - list
@@ -26,7 +35,6 @@ rules:
 - apiGroups:
   - observability.antnsn.dev
   resources:
-  - contactpoints
   - notificationpolicies
   - tenants
   verbs:
@@ -40,7 +48,6 @@ rules:
 - apiGroups:
   - observability.antnsn.dev
   resources:
-  - contactpoints/finalizers
   - notificationpolicies/finalizers
   - tenants/finalizers
   verbs:

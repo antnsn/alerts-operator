@@ -18,46 +18,124 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/index"
 )
 
-// ContactPointReconciler reconciles a ContactPoint object
+// ContactPointReconciler validates ContactPoints (tenant + secret refs) and sets Accepted.
 type ContactPointReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=contactpoints,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=contactpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups=observability.antnsn.dev,resources=contactpoints/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=contactpoints/finalizers,verbs=update
+// +kubebuilder:rbac:groups=observability.antnsn.dev,resources=tenants,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ContactPoint object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
-func (r *ContactPointReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+// Reconcile validates the ContactPoint against its referenced Tenant and Secret refs, then
+// sets the Accepted condition.
+func (r *ContactPointReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var cp v1alpha1.ContactPoint
+	if err := r.Get(ctx, req.NamespacedName, &cp); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-	// TODO(user): your logic here
+	status, reason, msg := metav1.ConditionTrue, v1alpha1.ReasonAccepted, ""
+	var tenant v1alpha1.Tenant
+	if err := r.Get(ctx, types.NamespacedName{Name: cp.Spec.TenantRef}, &tenant); errors.IsNotFound(err) {
+		status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonTenantNotFound, fmt.Sprintf("Tenant %q not found", cp.Spec.TenantRef)
+	} else if err != nil {
+		return ctrl.Result{}, err
+	} else {
+		missing, err := missingSecretRef(ctx, r.Client, cp.Namespace, cp.SecretRefs())
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if missing != "" {
+			status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonSecretNotFound, missing
+		}
+	}
 
-	return ctrl.Result{}, nil
+	changed := false
+	err := patchStatus(ctx, r.Client, &cp, func() {
+		changed = setCondition(&cp.Status.Conditions, v1alpha1.ConditionAccepted, status, reason, msg, cp.Generation)
+		changed = changed || cp.Status.ObservedGeneration != cp.Generation
+		cp.Status.ObservedGeneration = cp.Generation
+	}, &changed)
+	return ctrl.Result{}, err
+}
+
+// missingSecretRef returns a message for the first unresolvable ref, "" if all resolve.
+func missingSecretRef(ctx context.Context, c client.Client, namespace string, refs []v1alpha1.SecretKeyRef) (string, error) {
+	cache := map[string]*corev1.Secret{}
+	for _, ref := range refs {
+		sec, ok := cache[ref.Name]
+		if !ok {
+			sec = &corev1.Secret{}
+			err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, sec)
+			if errors.IsNotFound(err) {
+				sec = nil
+			} else if err != nil {
+				return "", err
+			}
+			cache[ref.Name] = sec
+		}
+		if sec == nil {
+			return fmt.Sprintf("secret %s/%s not found", namespace, ref.Name), nil
+		}
+		if _, ok := sec.Data[ref.Key]; !ok {
+			return fmt.Sprintf("secret %s/%s key %s not found", namespace, ref.Name, ref.Key), nil
+		}
+	}
+	return "", nil
+}
+
+func (r *ContactPointReconciler) secretToContactPoints(ctx context.Context, o client.Object) []reconcile.Request {
+	var list v1alpha1.ContactPointList
+	if err := r.List(ctx, &list, client.InNamespace(o.GetNamespace()), client.MatchingFields{index.IndexSecretRefs: o.GetName()}); err != nil {
+		return nil
+	}
+	return requestsFor(list.Items)
+}
+
+func (r *ContactPointReconciler) tenantToContactPoints(ctx context.Context, o client.Object) []reconcile.Request {
+	var list v1alpha1.ContactPointList
+	if err := r.List(ctx, &list, client.MatchingFields{index.IndexTenantRef: o.GetName()}); err != nil {
+		return nil
+	}
+	return requestsFor(list.Items)
+}
+
+func requestsFor[T any, PT interface {
+	*T
+	client.Object
+}](items []T) []reconcile.Request {
+	out := make([]reconcile.Request, 0, len(items))
+	for i := range items {
+		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(PT(&items[i]))})
+	}
+	return out
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ContactPointReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&observabilityv1alpha1.ContactPoint{}).
+		For(&v1alpha1.ContactPoint{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToContactPoints)).
+		Watches(&v1alpha1.Tenant{}, handler.EnqueueRequestsFromMapFunc(r.tenantToContactPoints)).
 		Named("contactpoint").
 		Complete(r)
 }

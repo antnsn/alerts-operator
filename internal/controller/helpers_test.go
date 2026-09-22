@@ -67,3 +67,5 @@ func createAndCleanup(t *testing.T, obj client.Object) {
 	}
 	t.Cleanup(func() { _ = testClient.Delete(testCtx, obj) })
 }
+
+func clientKey(obj client.Object) client.ObjectKey { return client.ObjectKeyFromObject(obj) }
