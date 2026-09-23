@@ -34,6 +34,9 @@ assert_has '^kind: ClusterRole$' "$OUT/default.yaml"
 assert_has '--leader-elect' "$OUT/default.yaml"
 assert_has '--metrics-bind-address=:8080' "$OUT/default.yaml"
 assert_has '--metrics-secure=false' "$OUT/default.yaml"
+# Secret/ConfigMap informers are unrestricted by default; the narrowing flag is only rendered when
+# cache.labelSelector is set (see values.yaml for what setting it obliges a user to do).
+assert_not '\-\-watch-label-selector' "$OUT/default.yaml"
 assert_has 'image: ghcr.io/antnsn/alerts-operator:0.1.0' "$OUT/default.yaml"
 assert_not '^kind: ServiceMonitor$' "$OUT/default.yaml"
 
@@ -76,6 +79,12 @@ assert_not '^kind: Service$' "$OUT/nometrics.yaml"
 assert_not '^kind: ServiceMonitor$' "$OUT/nometrics.yaml"
 assert_not '--metrics-bind-address=:8080' "$OUT/nometrics.yaml"
 assert_has '--metrics-bind-address=0' "$OUT/nometrics.yaml"
+
+# cache.labelSelector renders the narrowing flag only when set; unset must leave the informers
+# watching every Secret/ConfigMap (their payloads are stripped before caching either way, see
+# internal/controller/cache.go), because setting it obliges the user to label their Secrets.
+helm template x "$CHART" --namespace alerts-operator --include-crds --set cache.labelSelector=observability.antnsn.dev/watch=true > "$OUT/cachesel.yaml"
+assert_has '\-\-watch-label-selector=observability.antnsn.dev/watch=true' "$OUT/cachesel.yaml"
 
 # serviceAccount.create=false uses the given name and renders no ServiceAccount.
 helm template x "$CHART" --namespace alerts-operator --include-crds --set serviceAccount.create=false --set serviceAccount.name=custom-sa > "$OUT/customsa.yaml"

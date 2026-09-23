@@ -49,6 +49,9 @@ spec:
             - --metrics-bind-address=0
             {{- end }}
             - --health-probe-bind-address=:8081
+            {{- with .Values.cache.labelSelector }}
+            - --watch-label-selector={{ . }}
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}

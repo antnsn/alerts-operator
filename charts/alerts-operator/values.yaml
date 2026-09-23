@@ -31,6 +31,22 @@ serviceMonitor:
 # Extra args appended to the manager command line, e.g. ["--zap-log-level=debug"].
 extraArgs: []
 
+cache:
+  # Optional label selector restricting which Secrets and ConfigMaps the operator watches.
+  #
+  # Leave empty (the default) unless you have a reason not to. The operator already caches these
+  # two types WITHOUT their payloads -- it keeps names and labels only and reads every value live
+  # from the API server -- so an unrestricted watch costs metadata, not the cluster's secret
+  # material, and the 256Mi limit below is sized for that.
+  #
+  # Setting a selector (e.g. "observability.antnsn.dev/watch=true") narrows it further, and then
+  # you MUST label every Secret named by a ContactPoint secretKeyRef or a Tenant
+  # basicAuthSecretRef, and every ConfigMap named by a Tenant alertmanager.templatesRef.
+  # An unlabelled one still resolves, but a change to it no longer triggers a reconcile: a rotated
+  # credential is only picked up at the Tenant's next resyncInterval, and a ContactPoint waiting on
+  # a Secret that does not exist yet is never re-checked at all (that reconciler has no resync).
+  labelSelector: ""
+
 resources:
   requests:
     cpu: 10m

@@ -31,6 +31,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -65,6 +66,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var watchLabelSelector string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -85,6 +87,12 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&watchLabelSelector, "watch-label-selector", "",
+		"Optional label selector restricting the Secret and ConfigMap informers (e.g. "+
+			"observability.antnsn.dev/watch=true). Their payloads are never cached either way; this "+
+			"narrows which objects are watched at all, so an unselected Secret or ConfigMap still "+
+			"resolves but a change to it no longer triggers an immediate reconcile. Empty (the "+
+			"default) watches all of them.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -161,11 +169,23 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	// Secrets and ConfigMaps are watched cluster-wide (a secretKeyRef or templatesRef can name any
+	// namespace) but cached without their payloads, and read live instead. See
+	// controller.CacheOptions for the full reasoning; the two settings below are a pair and must
+	// not be separated.
+	cacheOptions, err := controller.CacheOptions(watchLabelSelector)
+	if err != nil {
+		setupLog.Error(err, "Invalid --watch-label-selector")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
+		Cache:                  cacheOptions,
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: controller.UncachedObjects()}},
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "42f10eab.antnsn.dev",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily

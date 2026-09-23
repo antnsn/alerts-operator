@@ -54,9 +54,19 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	testCtx, testCancel = context.WithCancel(context.Background())
+	// Exactly the cache/client pairing cmd/main.go ships: Secret and ConfigMap informers that hold
+	// no payload, and reads of those two types that bypass the cache. Wired here and not only in
+	// main so that every existing test which creates an unlabelled Secret and expects the
+	// reconcilers to resolve it is a live check that the shipped configuration still works.
+	cacheOptions, err := CacheOptions("")
+	if err != nil {
+		panic(err)
+	}
 	mgr, err := ctrl.NewManager(testCfg, ctrl.Options{
 		Scheme:  scheme.Scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
+		Cache:   cacheOptions,
+		Client:  client.Options{Cache: &client.CacheOptions{DisableFor: UncachedObjects()}},
 	})
 	if err != nil {
 		panic(err)
