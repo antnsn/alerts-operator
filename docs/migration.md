@@ -21,6 +21,14 @@ only stops the operator from *deleting* a document it can't prove it wrote; it d
 guard the *write* path. Point a Tenant with `tenantId: "1"` at Mimir, get a NotificationPolicy
 Accepted, and whatever was live in tenant `1` before that reconcile is gone.
 
+What the write path *does* guard is the other Tenants this operator manages: if a second Tenant CR
+shares this one's `tenantId` and `spec.mimir.address`, both address the same single document (the
+API is scoped by `X-Scope-OrgID` and the backend URL only, never by `rulesNamespacePrefix`) and
+**neither** writes it. Both report `AlertmanagerSynced=False/Conflict` naming the other and emit an
+`AlertmanagerOwnershipConflict` event; their rule namespaces keep syncing normally. So a `tenantId`
+already claimed by another Tenant CR will *not* be overwritten — but anything outside this
+operator's CRs still will be.
+
 Verified against this cluster today: tenant `1`'s Alertmanager config is currently empty, but
 tenant `anonymous` holds the real, currently-serving hand-written config (`mal-sync`, Keep +
 Pushover receivers) — step 6 below deletes it permanently via `DELETE /api/v1/alerts`. Back up

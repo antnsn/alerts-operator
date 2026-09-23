@@ -118,10 +118,11 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 }
 
 // claimants returns the other Tenants that currently share ownership, for backend be, of what this
-// Tenant is about to delete: always the same tenantId and backend address, plus the effective rules
-// namespace prefix when withPrefix is true. withPrefix must be true for a rule-namespace delete
-// (matching conflictingTenant's key in tenant_rules.go) and false for the Alertmanager delete, whose
-// backend key has no prefix component at all.
+// Tenant is about to delete. Ownership is sharesBackendTarget (tenant_rules.go), the one definition
+// this codebase has of "the same thing in the backend", shared with the steady-state guards so the
+// delete path and the write path can never disagree about it: withPrefix must be true for a
+// rule-namespace delete and false for the Alertmanager delete, whose backend key has no prefix
+// component at all.
 //
 // Reads via apiReader (the uncached API server reader), not the cache-backed embedded Client: this
 // result feeds straight into finalizeOwner's decision to remove this Tenant's finalizer, which never
@@ -141,17 +142,9 @@ func (r *TenantReconciler) claimants(ctx context.Context, tenant *v1alpha1.Tenan
 	}
 	var out []v1alpha1.Tenant
 	for i := range tenants.Items {
-		other := &tenants.Items[i]
-		if other.Name == tenant.Name {
-			continue
+		if other := &tenants.Items[i]; sharesBackendTarget(tenant, other, be, withPrefix) {
+			out = append(out, *other)
 		}
-		if other.Spec.TenantID != tenant.Spec.TenantID || backendAddress(other, be) != addr {
-			continue
-		}
-		if withPrefix && other.Prefix() != tenant.Prefix() {
-			continue
-		}
-		out = append(out, *other)
 	}
 	return out, nil
 }

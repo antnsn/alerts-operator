@@ -115,7 +115,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	// needs that guard: a namespace in `desired` is derived from one of our own children
 	// (<prefix><sep><child namespace><sep><name>), and a child has exactly one tenantRef, so no other
 	// Tenant can desire it and the per-group deletes in the diff loop above are never ambiguous.
-	conflict, conflictErr := r.conflictingTenant(ctx, tenant, be)
+	conflict, conflictErr := r.conflictingTenant(ctx, tenant, be, true)
 	var pruneErrs []error
 	switch {
 	case conflictErr != nil:
@@ -189,35 +189,23 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	return desiredCount, nil
 }
 
-// conflictingTenant returns the name of another Tenant CR whose backend rule namespaces for
-// backend be are indistinguishable from this one's, or "" when this Tenant is the sole claimant.
+// conflictingTenant returns the name of another Tenant CR whose claim on one backend target is
+// indistinguishable from this one's, or "" when this Tenant is the sole claimant. withPrefix
+// selects which of the two ownership keys is meant; see sharesBackendTarget.
 //
-// Ownership is a three-part key -- (tenantId, backend address, effective prefix) -- because that is
-// exactly what decides both what store.List returns and what the prune loop reads as "mine":
-// X-Scope-OrgID comes from spec.tenantId, the endpoint from spec.{mimir,loki}.address, and the
-// <prefix><sep><k8s namespace><sep><name> namespace scheme from Prefix() (sep is "/" on Mimir and
-// "_" on Loki -- see compile.BackendNamespace). Nothing in the Mimir or Loki rule
-// API carries the owning Tenant, and the namespace scheme is fixed by the design, so two Tenants on
-// the same key are genuinely indistinguishable in the backend -- the collision can only be caught
-// here, at reconcile time, by looking at the CRs.
-//
-// Compared on Prefix(), not spec.rulesNamespacePrefix: an unset field and an explicit
-// "alerts-operator" name the same namespaces (a Tenant stored before +kubebuilder:default existed
-// reads back defaulted, but a raw-field comparison would still miss the pair).
+// Nothing in the Mimir or Loki API carries the owning Tenant, and both the namespace scheme and the
+// Alertmanager document's address are fixed by the design, so two Tenants on the same key are
+// genuinely indistinguishable in the backend -- the collision can only be caught here, at reconcile
+// time, by looking at the CRs.
 //
 // Mimir and Loki are evaluated independently: two Tenants sharing one Mimir may have separate Lokis
 // or none at all, so a collision on one backend must not stop the other's prune.
 //
-// Terminating Tenants still count: their namespaces stay live until their own finalizer removes
-// them, and the CR disappearing is what clears the conflict.
-//
-// The match is textual, so two spellings of one endpoint (an IP and a DNS name, two Services in
-// front of the same ruler) are not detected; only a trailing slash is normalised away. That
-// residual case is the one the design's "one Tenant per (org, backend)" expectation covers.
-func (r *TenantReconciler) conflictingTenant(ctx context.Context, tenant *v1alpha1.Tenant, be v1alpha1.Backend) (string, error) {
-	addr := backendAddress(tenant, be)
-	if addr == "" {
-		return "", nil // backend not configured: syncRules isn't called for it
+// Terminating Tenants still count: their backend state stays live until their own finalizer removes
+// it, and the CR disappearing is what clears the conflict.
+func (r *TenantReconciler) conflictingTenant(ctx context.Context, tenant *v1alpha1.Tenant, be v1alpha1.Backend, withPrefix bool) (string, error) {
+	if backendAddress(tenant, be) == "" {
+		return "", nil // backend not configured: syncRules/syncAlertmanager aren't called for it
 	}
 	var tenants v1alpha1.TenantList
 	if err := r.List(ctx, &tenants); err != nil {
@@ -229,10 +217,7 @@ func (r *TenantReconciler) conflictingTenant(ctx context.Context, tenant *v1alph
 	conflict := ""
 	for i := range tenants.Items {
 		other := &tenants.Items[i]
-		if other.Name == tenant.Name {
-			continue
-		}
-		if other.Spec.TenantID != tenant.Spec.TenantID || other.Prefix() != tenant.Prefix() || backendAddress(other, be) != addr {
+		if !sharesBackendTarget(tenant, other, be, withPrefix) {
 			continue
 		}
 		if conflict == "" || other.Name < conflict {
@@ -240,6 +225,48 @@ func (r *TenantReconciler) conflictingTenant(ctx context.Context, tenant *v1alph
 		}
 	}
 	return conflict, nil
+}
+
+// sharesBackendTarget reports whether other is a different Tenant CR that owns the same backend
+// target as tenant on backend be. It is the single definition of "the same thing in the backend"
+// in this codebase: the steady-state guards (conflictingTenant, for the rule-namespace prune and
+// the Alertmanager write) and the delete-time guard (claimants, tenant_finalizer.go) must agree on
+// it, or one half would refuse to write what the other half is willing to delete.
+//
+// Two keys, deliberately not the same one -- withPrefix selects between them:
+//
+//   - withPrefix=true, rule namespaces: (tenantId, backend address, effective prefix). That is
+//     exactly what decides both what store.List returns and what the prune loop reads as "mine":
+//     X-Scope-OrgID comes from spec.tenantId, the endpoint from spec.{mimir,loki}.address, and the
+//     <prefix><sep><k8s namespace><sep><name> scheme from Prefix() (sep is "/" on Mimir and "_" on
+//     Loki -- see compile.BackendNamespace). Two Tenants with different prefixes genuinely do not
+//     collide here.
+//   - withPrefix=false, the Alertmanager document: (tenantId, backend address) only. GET/POST/
+//     DELETE /api/v1/alerts is scoped solely by X-Scope-OrgID and the backend, so two Tenants
+//     sharing those share one live document even when their prefixes differ -- and
+//     rulesNamespacePrefix exists precisely to let several Tenants share one org, so that pair is
+//     a natural configuration rather than an exotic one.
+//
+// Compared on Prefix(), not spec.rulesNamespacePrefix: an unset field and an explicit
+// "alerts-operator" name the same namespaces (a Tenant stored before +kubebuilder:default existed
+// reads back defaulted, but a raw-field comparison would still miss the pair).
+//
+// The address match is textual, so two spellings of one endpoint (an IP and a DNS name, two
+// Services in front of the same ruler) are not detected; only a trailing slash is normalised away
+// (backendAddress). That residual case is the one the design's "one Tenant per (org, backend)"
+// expectation covers.
+func sharesBackendTarget(tenant, other *v1alpha1.Tenant, be v1alpha1.Backend, withPrefix bool) bool {
+	if other.Name == tenant.Name {
+		return false
+	}
+	if other.Spec.TenantID != tenant.Spec.TenantID {
+		return false
+	}
+	addr := backendAddress(tenant, be)
+	if addr == "" || backendAddress(other, be) != addr {
+		return false
+	}
+	return !withPrefix || other.Prefix() == tenant.Prefix()
 }
 
 // backendAddress returns tenant's address for backend be with any trailing slash removed, or ""

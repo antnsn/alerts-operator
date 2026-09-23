@@ -21,8 +21,10 @@ import (
 )
 
 // syncAlertmanager compiles and pushes the tenant's Alertmanager document. It sets
-// AlertmanagerSynced on the tenant and Synced on the policy and contact points. The returned
-// error is non-nil only when the backend was unavailable.
+// AlertmanagerSynced on the tenant and Synced on the policy and contact points. The returned error
+// is non-nil only when the backend was unavailable, or when another Tenant's claim on the document
+// could not be checked at all (see the ownership guard below) -- both cases the caller must back
+// off and retry rather than treat as a settled verdict.
 func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha1.Tenant, store backend.AlertmanagerStore, ch *children) error {
 	gen := tenant.Generation
 	setTenant := func(status metav1.ConditionStatus, reason, msg string) {
@@ -82,6 +84,57 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 			}
 		}
 		setTenant(metav1.ConditionFalse, v1alpha1.ReasonInvalid, err.Error())
+		return nil
+	}
+
+	// Ownership guard, the steady-state counterpart to the finalizer's (tenant_finalizer.go) and
+	// the exact analogue of syncRules' prune guard -- with the opposite verdict about writing,
+	// because the two targets differ in kind.
+	//
+	// For rule namespaces the ruling is "ambiguous ownership never deletes, but still writes":
+	// two Tenants' rule groups occupy different namespaces, so their writes are convergent and
+	// only the prune is destructive. The Alertmanager document has no such separation. There is
+	// exactly one document per (tenantId, address) -- POST /api/v1/alerts replaces it whole -- so
+	// a write here *is* a delete of whatever the other claimant put there. Under the same rule
+	// ("never destroy on an unverified claim") the write must be refused.
+	//
+	// What the two Tenants' owners see: both report AlertmanagerSynced=False/Conflict naming each
+	// other, both emit a Warning event, and Ready goes False/Conflict. The live document freezes
+	// at whatever was last written rather than flipping between the two every resyncInterval.
+	// That is strictly better than the alternative it replaces -- routing silently alternating
+	// every 5 minutes with both Tenants reporting Ready=True, no event, no condition, and real
+	// notifications going to the wrong receivers in between. Frozen and loud beats churning and
+	// silent: the cost is that a *freshly* colliding pair gets no document at all until an
+	// operator gives one of them its own tenantId or address, which the condition says outright.
+	//
+	// Rules are untouched by this: syncRules keeps its own per-backend verdict, so two Tenants
+	// with different prefixes go on syncing their rule groups normally while this one condition
+	// reports the shared document they cannot both own.
+	conflict, err := r.conflictingTenant(ctx, tenant, v1alpha1.BackendMimir, false)
+	if err != nil {
+		// Ownership could not be established at all: same rule as a real collision (never write on
+		// an unverified claim), but Unknown/Pending rather than False, and returned so the caller
+		// backs off and retries instead of leaving a transient apiserver failure to sit until the
+		// next resync. Unknown/Pending also makes Ready preserve its previous value rather than
+		// asserting a verdict this pass never established.
+		msg := fmt.Sprintf("cannot verify alertmanager ownership: %v", err)
+		setTenant(metav1.ConditionUnknown, v1alpha1.ReasonPending, msg)
+		return fmt.Errorf("%s", msg)
+	}
+	if conflict != "" {
+		msg := fmt.Sprintf(
+			"Tenant %q claims the same Alertmanager document (tenantId %q, address %s); "+
+				"/api/v1/alerts is scoped by tenantId and address only, never by rulesNamespacePrefix, "+
+				"so exactly one Tenant may write it -- give one of them its own tenantId or address",
+			conflict, tenant.Spec.TenantID, backendAddress(tenant, v1alpha1.BackendMimir))
+		setTenant(metav1.ConditionFalse, v1alpha1.ReasonConflict, msg)
+		if ch.Policy != nil {
+			r.setChildStatus(ctx, ch.Policy, metav1.ConditionFalse, v1alpha1.ReasonConflict, msg)
+		}
+		for i := range ch.ContactPoints {
+			r.setChildStatus(ctx, &ch.ContactPoints[i], metav1.ConditionFalse, v1alpha1.ReasonConflict, msg)
+		}
+		r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "AlertmanagerOwnershipConflict", "%s", msg)
 		return nil
 	}
 

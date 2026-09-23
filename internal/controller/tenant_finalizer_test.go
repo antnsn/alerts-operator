@@ -90,17 +90,21 @@ func writingContactPointAndPolicy(tenantRef, suffix string) (*observabilityv1alp
 // for rule namespaces but wrong for the Alertmanager document -- POST/GET/DELETE /api/v1/alerts is
 // scoped only by X-Scope-OrgID (tenantId) and backend address, never by prefix. Two Tenants sharing
 // tenantId+address but using different prefixes therefore share one live Alertmanager config even
-// though conflictingTenant(mimir) reports no conflict between them (their rule namespaces genuinely
-// don't collide). Deleting one must not wipe the other's shared, live config.
+// though conflictingTenant(mimir, withPrefix=true) reports no conflict between them (their rule
+// namespaces genuinely don't collide). Deleting one must not wipe the other's shared, live config.
 //
-// Both Tenants here actually write their own Alertmanager document (real ContactPoint +
-// NotificationPolicy each), not just have spec.mimir set: after the P2-1/P2-2 fix (task-20 review
-// round 1), a Tenant that never wrote an Alertmanager document never attempts to delete one and is
-// never counted as a valid claimant to defer to (see TestTenantFinalizerLeavesNeverWrittenAlertmanagerConfig
-// and TestTenantFinalizerDeletesOwnAlertmanagerDespiteNonWritingClaimant). Without both Tenants here
-// being real writers, this test would pass for the wrong reason -- dying's own P2-1 gate would skip
-// the delete attempt before ever reaching the prefix-independent ownership check this test exists to
-// cover.
+// Both Tenants must carry a confirmed status.alertmanagerConfigHash at this address or the test
+// passes for the wrong reason: dying's own P2-1 gate (hash != "", task-20 review round 1) would
+// skip the delete attempt before ever reaching the prefix-independent ownership check, and
+// survivor would be filtered out of writingClaimants so there would be nobody to defer to.
+//
+// Since the steady-state ownership guard landed (tenant_alertmanager.go), a second Tenant sharing
+// the key never writes the document and so never earns a hash of its own -- which leaves exactly
+// one way for two hashes to coexist, and it is the one that matters most: a cluster upgraded from
+// a release without the guard, where both Tenants had been overwriting each other every resync and
+// both recorded a hash for it. dying's status is therefore seeded directly here rather than
+// produced by a live write, because that is the state the upgrade actually leaves behind, and it
+// is the state in which deleting one Tenant would destroy the other's live routing.
 func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	srv := fake.New()
 	defer srv.Close()
@@ -122,6 +126,7 @@ func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	if err := testClient.Create(testCtx, survivorPol); err != nil {
 		t.Fatal(err)
 	}
+	// Created and synced while it is still the sole claimant, so this hash is a genuine one.
 	waitCondition(t, survivor, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
 
 	dying := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-am-dying"},
@@ -136,10 +141,10 @@ func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	if err := testClient.Create(testCtx, dyingPol); err != nil {
 		t.Fatal(err)
 	}
-	waitCondition(t, dying, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
-	if dying.Status.AlertmanagerConfigHash == "" {
-		t.Fatal("precondition: dying never wrote an alertmanager document")
-	}
+	// Both Tenants now see each other: the guard freezes the document rather than letting them
+	// take turns overwriting it, which is the steady-state half of this same finding.
+	waitCondition(t, dying, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionFalse, observabilityv1alpha1.ReasonConflict)
+	seedAlertmanagerConfigHash(t, dying, srv.URL)
 
 	if err := testClient.Delete(testCtx, dying); err != nil {
 		t.Fatal(err)
@@ -159,6 +164,24 @@ func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		return errors.IsNotFound(testClient.Get(testCtx, clientKey(survivor), &observabilityv1alpha1.Tenant{}))
+	})
+}
+
+// seedAlertmanagerConfigHash writes the two status fields the finalizer reads as "this Tenant wrote
+// the live Alertmanager document at this address". Retried against the live Tenant reconciler's own
+// status patches: the reconciler never clears either field (syncAlertmanager only ever sets them,
+// and its status patch is a MergeFrom diff), so a write that lands survives -- but it can still lose
+// an optimistic-lock race on the way in.
+func seedAlertmanagerConfigHash(t *testing.T, tn *observabilityv1alpha1.Tenant, addr string) {
+	t.Helper()
+	waitFor(t, func() bool {
+		var cur observabilityv1alpha1.Tenant
+		if err := testClient.Get(testCtx, clientKey(tn), &cur); err != nil {
+			return false
+		}
+		cur.Status.AlertmanagerConfigHash = "sha256:seeded-by-a-pre-guard-release"
+		cur.Status.AlertmanagerConfigAddress = addr
+		return testClient.Status().Update(testCtx, &cur) == nil
 	})
 }
 
