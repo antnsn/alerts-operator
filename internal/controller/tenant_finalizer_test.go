@@ -98,13 +98,15 @@ func writingContactPointAndPolicy(tenantRef, suffix string) (*observabilityv1alp
 // skip the delete attempt before ever reaching the prefix-independent ownership check, and
 // survivor would be filtered out of writingClaimants so there would be nobody to defer to.
 //
-// Since the steady-state ownership guard landed (tenant_alertmanager.go), a second Tenant sharing
-// the key never writes the document and so never earns a hash of its own -- which leaves exactly
-// one way for two hashes to coexist, and it is the one that matters most: a cluster upgraded from
-// a release without the guard, where both Tenants had been overwriting each other every resync and
-// both recorded a hash for it. dying's status is therefore seeded directly here rather than
-// produced by a live write, because that is the state the upgrade actually leaves behind, and it
-// is the state in which deleting one Tenant would destroy the other's live routing.
+// Since the steady-state ownership guard landed (tenant_alertmanager.go), a Tenant that sees a peer
+// already holding a hash refuses to write and so never earns one of its own. The state two hashes
+// come from is a **create race**: conflictingAlertmanagerWriter reads the cache-backed client
+// (claimantsVia in tenant_rules.go), so two Tenants created together can each reconcile before the
+// informer shows the peer, each write once, and each record a hash. That window is narrow but real,
+// and afterwards both refuse permanently -- which is exactly the state in which deleting one Tenant
+// would destroy the other's live routing, and the state this test covers. dying's status is
+// therefore seeded directly rather than produced by a live write: the race cannot be triggered on
+// demand, but its outcome can be stated exactly.
 func TestTenantFinalizerSkipsSharedAlertmanagerAcrossPrefixes(t *testing.T) {
 	srv := fake.New()
 	defer srv.Close()

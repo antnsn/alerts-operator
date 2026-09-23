@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -92,20 +93,48 @@ func TestCacheOptionsKeepsNoSecretOrConfigMapPayload(t *testing.T) {
 	}
 }
 
-// TestCacheOptionsTransformPassesThroughUnknownTypes guards the informer contract: a transform is
-// also handed tombstones (cache.DeletedFinalStateUnknown) and must not panic or drop them.
-func TestCacheOptionsTransformPassesThroughUnknownTypes(t *testing.T) {
+// TestCacheOptionsTransformIsTotalAndIdempotent pins the two properties an informer transform must
+// have. Neither is about tombstones: client-go v0.37 skips the transformer for a
+// DeletedFinalStateUnknown and for already-transformed objects
+// (RealFIFO.addToItems_locked, tools/cache/the_real_fifo.go:255-281), so one never reaches it.
+//
+//   - Total, because one function is registered for both ByObject entries and an error from a
+//     transform fails the FIFO write, dropping the object from the cache.
+//   - Idempotent, because RealFIFO documents that objects handed to Replace() may already have been
+//     transformed -- which is what makes mutating in place safe here.
+func TestCacheOptionsTransformIsTotalAndIdempotent(t *testing.T) {
 	opts, err := CacheOptions("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tombstone := struct{ Key string }{Key: "n/s"}
-	out, err := byObjectFor[*corev1.Secret](t, opts).Transform(tombstone)
+	transform := byObjectFor[*corev1.Secret](t, opts).Transform
+
+	unrecognised := struct{ Key string }{Key: "n/s"}
+	out, err := transform(unrecognised)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != any(tombstone) {
+	if out != any(unrecognised) {
 		t.Fatalf("an object the transform does not recognise must be returned unchanged, got %#v", out)
+	}
+
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "n", Labels: map[string]string{"keep": "me"}},
+		Data:       map[string][]byte{"password": []byte("hunter2")},
+	}
+	once, err := transform(sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	twice, err := transform(once)
+	if err != nil {
+		t.Fatalf("re-transforming an already-transformed object must not fail: %v", err)
+	}
+	if !reflect.DeepEqual(once, twice) {
+		t.Fatalf("transform is not idempotent: %+v then %+v", once, twice)
+	}
+	if s := twice.(*corev1.Secret); len(s.Data) != 0 || s.Labels["keep"] != "me" {
+		t.Fatalf("a second pass must neither restore payload nor lose metadata: %+v", s)
 	}
 }
 

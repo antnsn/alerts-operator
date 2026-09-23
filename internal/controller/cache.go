@@ -76,9 +76,17 @@ func UncachedObjects() []client.Object {
 // the informer store. Applied by the informer to each object as it is decoded, before it is
 // indexed, so the full object never becomes resident.
 //
-// Objects it does not recognise are returned unchanged: an informer also hands a transform
-// tombstones (cache.DeletedFinalStateUnknown) on a missed delete, and swallowing one would lose the
-// delete event.
+// Two properties this has to hold, neither of which is about tombstones -- client-go v0.37 skips the
+// transformer entirely for a DeletedFinalStateUnknown and for anything already transformed
+// (RealFIFO.addToItems_locked, tools/cache/the_real_fifo.go:255-281), so one never reaches here:
+//
+//   - Total. One function is registered for both ByObject entries, so the type switch is what lets
+//     it serve Secret and ConfigMap at once, and anything else must come back unchanged rather than
+//     error -- a transform that returns an error fails the FIFO write and the object is dropped
+//     from the cache entirely.
+//   - Idempotent. RealFIFO documents that objects handed to Replace() may already have been
+//     transformed and that re-transforming them must be safe. Nil-ing fields that are already nil
+//     is, which is the only reason this shape is allowed to mutate in place.
 func stripPayload(in any) (any, error) {
 	switch o := in.(type) {
 	case *corev1.Secret:

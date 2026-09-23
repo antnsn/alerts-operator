@@ -30,12 +30,19 @@ import (
 //   - amconfig.Load parses YAML only. It is config.LoadFile, not Load, that resolves the
 //     "templates" entries against a base directory, so the compiled document's bare template names
 //     pass through Load untouched and no path rewriting is needed at all.
-//   - template.Template.Parse takes an io.Reader and is exactly what FromGlobs calls per file
-//     after ParseGlob. template.New installs the same DefaultFuncs FromGlobs relies on. The two
-//     embedded defaults FromGlobs parses first (default.tmpl, email.tmpl) are unreachable from
-//     here -- the embed.FS is unexported -- and are not needed: text/template resolves
-//     {{ template "name" }} references at execution time, not at parse time, so a user template
-//     referring to a default one parses identically with or without them.
+//   - template.Template.Parse takes an io.Reader and parses into the same text+html pair FromGlobs
+//     builds, with template.New installing the same DefaultFuncs -- which is the part that matters
+//     here, since a template using toUpper or reReplaceAll must not be rejected. It is *not* what
+//     FromGlobs calls for a user file, despite the symmetry: FromGlobs calls Parse only for its two
+//     embedded defaults (template/template.go:77-98) and routes every user path through FromGlob ->
+//     text/html ParseGlob (:120-136), which associates a file's body with a template named after
+//     the file's basename rather than with the root template. That difference does not affect a
+//     parse-only validation -- neither form errors on it -- and the review of this fix ran 18
+//     template corpora through both paths with identical accept/reject in all 18.
+//   - The two embedded defaults are unreachable from here (the embed.FS is unexported) and are not
+//     needed: text/template resolves {{ template "name" }} references at execution time, not at
+//     parse time, so a user template referring to (or redefining) a default one parses identically
+//     with or without them. Also confirmed empirically in that review, not assumed.
 //
 // Templates are parsed in sorted name order so a document with several broken templates always
 // reports the same one.
