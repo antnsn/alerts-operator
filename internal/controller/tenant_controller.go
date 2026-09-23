@@ -128,12 +128,12 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// for the life of the process.
 		metrics.DeleteTenant(tenant.Name)
 		controllerutil.RemoveFinalizer(&tenant, tenantFinalizer)
-		return requeueOnConflict(ctx, r.Update(ctx, &tenant), "remove finalizer")
+		return requeueOnConflict(ctx, r.Update(ctx, &tenant), "remove finalizer", tenant.Name)
 	}
 
 	if controllerutil.AddFinalizer(&tenant, tenantFinalizer) {
 		// Update triggers a new reconcile; a 409 here (racing a child's first Accepted patch) too.
-		return requeueOnConflict(ctx, r.Update(ctx, &tenant), "add finalizer")
+		return requeueOnConflict(ctx, r.Update(ctx, &tenant), "add finalizer", tenant.Name)
 	}
 
 	// Snapshot before the sync functions mutate tenant.Status in memory; the final
@@ -226,7 +226,7 @@ func (r *TenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			// A 409 means a child's reconciler patched this Tenant between our Get and now (two
 			// children changing in the same second do this routinely). The backend work above
 			// already happened; only the status report lost the race. Requeue, don't error.
-			return requeueOnConflict(ctx, err, "status patch")
+			return requeueOnConflict(ctx, err, "status patch", tenant.Name)
 		}
 	}
 	if firstErr != nil {

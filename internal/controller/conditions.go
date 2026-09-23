@@ -73,14 +73,14 @@ func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate
 // object -- so it is not a reconciler error: returning it as one made controller-runtime log
 // "ERROR Reconciler error" with a stack trace on every burst of child changes, although the retry
 // always converged. Any other error is returned unchanged.
-func requeueOnConflict(ctx context.Context, err error, what string) (ctrl.Result, error) {
+func requeueOnConflict(ctx context.Context, err error, what, name string) (ctrl.Result, error) {
 	if err == nil {
 		return ctrl.Result{}, nil
 	}
 	if !apierrors.IsConflict(err) {
 		return ctrl.Result{}, err
 	}
-	log.FromContext(ctx).V(1).Info("optimistic-lock conflict, requeueing", "write", what, "err", err.Error())
+	log.FromContext(ctx).V(1).Info("Tenant write conflicted, requeueing", "tenant", name, "write", what, "err", err.Error())
 	return ctrl.Result{RequeueAfter: conflictRequeueAfter}, nil
 }
 
