@@ -12,8 +12,8 @@
 Run executed 2026-09-22 against commit `2ff8497`, image `ghcr.io/antnsn/alerts-operator:sha-2ff8497`.
 
 > **§4's Loki assertions are stale and were never re-run.** They were observed against the broken
-> `/`-joined Loki namespace scheme. The fix for that (`alerts-operator-b4o`) has landed but has
-> **not** been verified on a live cluster — see §8 for what still has to be proven.
+> `/`-joined Loki namespace scheme. The fix for that (`alerts-operator-b4o`, commit `67b2239`) has
+> landed but has **not** been verified on a live cluster — see §8 for what still has to be proven.
 
 No kind. The acceptance run is against the real Mimir (`mimir-distributed-nginx.mimir:80`) and
 Loki (`loki-gateway.loki`), but under its own backend tenant `e2e` (Mimir/Loki multitenancy keeps
@@ -265,8 +265,9 @@ fixed — see §8:
 ### §4 Loki steps: NOT RE-RUN — pending live verification
 
 The Loki half of §4 above is still recorded as it was observed on 2026-09-22, against the broken
-namespace scheme. A fix has landed on `main` (`_` as the Loki namespace separator — see §8) but
-**nobody has re-run these steps against a live cluster**, so nothing here may be read as a pass.
+namespace scheme. A fix has landed on `main` (`_` as the Loki namespace separator — commit `67b2239`, see §8)
+but **nobody has re-run these steps against a live cluster**, so nothing here may be read as a
+pass.
 
 ## 5. Fire a real alert — PASSED (via a throwaway echo receiver, see deviations above)
 
@@ -391,10 +392,12 @@ one bulk read covers the whole diff — not because the per-group route is broke
 
 ### What must be proven once the cluster is back
 
-Run against the commit that carries the fix, deploying the `:sha-<short>` image the `dev-image`
-job builds for it (not `:dev`). Namespace `e2e`, backend tenant `e2e`, prefix `e2e`.
+The commit to verify is **`67b2239`** ("fix(loki): join rule namespaces with `_` so Loki's ruler
+can address them"), or any later `main` that contains it. Deploy the `:sha-<short>` image the
+`dev-image` job builds for that commit — `ghcr.io/antnsn/alerts-operator:sha-67b2239` — not `:dev`.
+Namespace `e2e`, backend tenant `e2e`, prefix `e2e`.
 
-1. `make deploy-dev` at the fix commit's `sha-` tag.
+1. `make deploy-dev` with `DEV_IMG_TAG=sha-67b2239`.
 2. Apply `docs/examples/alertrulegroup-loki.yaml` rewritten for the `e2e` namespace/tenant
    (apply each example file separately — see deviation 3).
 3. `kubectl -n e2e get alertrulegroup udm -o yaml` → `Accepted=True`, **`Synced=True`**, and
