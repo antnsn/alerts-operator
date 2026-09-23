@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- A 409 optimistic-lock conflict on the Tenant's status patch or finalizer update (routine when two children change in the same second, since each child's reconciler patches the Tenant too) is now a quiet requeue instead of a reconciler error. Previously every such burst logged `ERROR Reconciler error` with a stack trace although the retry always converged.
+
 ## [0.1.1] - 2026-09-23
 
 ### Fixed

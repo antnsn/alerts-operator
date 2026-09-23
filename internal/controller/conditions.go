@@ -2,12 +2,16 @@ package controller
 
 import (
 	"context"
+	"time"
 	"unicode/utf8"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
@@ -62,6 +66,28 @@ func patchStatus(ctx context.Context, c client.Client, obj client.Object, mutate
 	}
 	return c.Status().Patch(ctx, obj, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
+
+// requeueOnConflict turns a 409 from an optimistic-lock write into a quiet requeue. The lock is
+// doing its job -- a concurrent writer (typically a child's own reconciler patching Accepted in
+// the same second the Tenant patches Synced) won the race, and the next pass starts from the fresh
+// object -- so it is not a reconciler error: returning it as one made controller-runtime log
+// "ERROR Reconciler error" with a stack trace on every burst of child changes, although the retry
+// always converged. Any other error is returned unchanged.
+func requeueOnConflict(ctx context.Context, err error, what string) (ctrl.Result, error) {
+	if err == nil {
+		return ctrl.Result{}, nil
+	}
+	if !apierrors.IsConflict(err) {
+		return ctrl.Result{}, err
+	}
+	log.FromContext(ctx).V(1).Info("optimistic-lock conflict, requeueing", "write", what, "err", err.Error())
+	return ctrl.Result{RequeueAfter: conflictRequeueAfter}, nil
+}
+
+// conflictRequeueAfter is how soon a conflicted write is retried. Short, because the object the
+// next pass needs is already in the API server; long enough that the concurrent writer's own
+// watch event has usually been processed first, so the retry does not lose the same race again.
+const conflictRequeueAfter = 500 * time.Millisecond
 
 func tenantRequest(name string) reconcile.Request {
 	return reconcile.Request{NamespacedName: types.NamespacedName{Name: name}}

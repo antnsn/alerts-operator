@@ -159,6 +159,13 @@ func acceptedAt(gen int64) []metav1.Condition {
 // needs this to drive r.Reconcile, which patches Tenant/AlertRuleGroup status, against this fixture).
 func newChildrenFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+	return newChildrenFakeClientBuilder(objs...).Build()
+}
+
+// newChildrenFakeClientBuilder is newChildrenFakeClient before Build(), for tests that need to
+// add interceptors or other builder options on top of the same scheme, status subresources and
+// tenantRef indexes.
+func newChildrenFakeClientBuilder(objs ...client.Object) *fake.ClientBuilder {
 	return fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithStatusSubresource(&observabilityv1alpha1.Tenant{}, &observabilityv1alpha1.ContactPoint{},
@@ -172,8 +179,7 @@ func newChildrenFakeClient(t *testing.T, objs ...client.Object) client.Client {
 		WithIndex(&observabilityv1alpha1.AlertRuleGroup{}, index.IndexTenantRef, func(o client.Object) []string {
 			return []string{o.(*observabilityv1alpha1.AlertRuleGroup).Spec.TenantRef}
 		}).
-		WithObjects(objs...).
-		Build()
+		WithObjects(objs...)
 }
 
 // TestTenantListChildrenStaleGeneration covers listChildren's stale-generation branch: a child

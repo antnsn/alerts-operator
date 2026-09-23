@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -121,5 +122,31 @@ func TestSyncedFromErr(t *testing.T) {
 		if s != c.status || r != c.reason {
 			t.Fatalf("%v → %s/%s", c.err, s, r)
 		}
+	}
+}
+
+// TestSetConditionKeepsLastTransitionTimeWhenStatusUnchanged: re-applying a condition whose
+// Status did not change must not move lastTransitionTime, even when reason/message/generation
+// differ; only a Status flip is a transition. (Bead d2e, secondary symptom.)
+func TestSetConditionKeepsLastTransitionTimeWhenStatusUnchanged(t *testing.T) {
+	var conds []metav1.Condition
+	setCondition(&conds, "Synced", metav1.ConditionTrue, "Synced", "", 1)
+	past := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	conds[0].LastTransitionTime = past
+
+	setCondition(&conds, "Synced", metav1.ConditionTrue, "Synced", "", 1)
+	if !conds[0].LastTransitionTime.Equal(&past) {
+		t.Fatalf("identical re-apply moved lastTransitionTime to %v", conds[0].LastTransitionTime)
+	}
+	setCondition(&conds, "Synced", metav1.ConditionTrue, "Synced", "re-verified", 2)
+	if !conds[0].LastTransitionTime.Equal(&past) {
+		t.Fatalf("same-status re-apply with new message/generation moved lastTransitionTime to %v", conds[0].LastTransitionTime)
+	}
+	if conds[0].ObservedGeneration != 2 || conds[0].Message != "re-verified" {
+		t.Fatalf("message/generation must still update, got %+v", conds[0])
+	}
+	setCondition(&conds, "Synced", metav1.ConditionFalse, "Rejected", "boom", 2)
+	if conds[0].LastTransitionTime.Equal(&past) {
+		t.Fatal("a real status flip must move lastTransitionTime")
 	}
 }
