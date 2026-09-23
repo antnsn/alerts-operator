@@ -378,6 +378,16 @@ promptly rather than leaving it for later.
 
 ## Appendix B: recovering a Tenant stuck `Terminating`
 
+
+> **This also degrades other Tenants, not just the stuck one.** A Tenant sitting `Terminating`
+> still counts as a claimant of its backend targets (its state stays live until its own finalizer
+> removes it), so any healthy Tenant sharing its `tenantId` + address keeps reporting
+> `Ready=False/Conflict`: its rule-namespace prune stays disabled, and — since the Alertmanager
+> ownership guard landed — its Alertmanager document stays frozen too. Nothing bounds how long.
+> Tracked as `alerts-operator-bqf`, with `alerts-operator-29k` (the survivor is not re-enqueued
+> when the peer finally disappears, so recovery can still take up to one `resyncInterval`). Treat
+> a wedged Tenant as urgent for that reason, not only for its own sake.
+
 If a Tenant's `spec.{mimir,loki}.auth.basicAuthSecretRef` names a Secret that no longer exists at
 the moment the Tenant is deleted, the finalizer (`internal/controller/tenant_finalizer.go`) cannot
 build a backend client — `backendOptions` returns `basic auth secret <namespace>/<name> not
