@@ -2,6 +2,8 @@ package compile
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -150,11 +152,18 @@ func TestAlertmanagerRedactsSecretsFromErrors(t *testing.T) {
 	}
 }
 
-func TestAlertmanagerTemplateRewriteScopedToTemplatesKey(t *testing.T) {
+// TestAlertmanagerTemplateNameCollidingWithAGroupByLabel keeps a historical regression pinned: two
+// earlier versions of ValidateAlertmanager rewrote the compiled document's "templates" entries to
+// temp-file paths -- first by a whole-document string replace, then by unmarshaling and replacing
+// only that key -- before handing them to template.FromGlobs. The rewrite is gone entirely (the
+// loader never reads files, see validate.go), so a template name that happens to equal a group_by
+// label, a matcher or a receiver name can no longer corrupt anything by construction. This asserts
+// that property from the outside so a future reintroduction of any document rewriting is caught.
+func TestAlertmanagerTemplateNameCollidingWithAGroupByLabel(t *testing.T) {
 	// "default.tmpl" cannot itself be used here: it contains a "." and so is never a valid
 	// Alertmanager group_by label name (`^[a-zA-Z_][a-zA-Z0-9_]*$`), which would make this test
 	// fail regardless of the bug under test. "clashname" is a valid label name that still
-	// collides textually with the template's map key, which is what the whole-document
+	// collides textually with the template's map key, which is what the original whole-document
 	// string-replace bug actually depended on.
 	in := fullInput()
 	in.Policy.Spec.Route.GroupBy = []string{"alertname", "clashname"}
@@ -186,5 +195,55 @@ func TestValidatePromQL(t *testing.T) {
 	}
 	if err := ValidatePromQL(`up{job=`); err == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+// readOnlyFilesystem points every temp-directory environment variable Go's os.TempDir consults at a
+// path that does not exist, so any os.MkdirTemp/os.CreateTemp call fails with ENOENT -- for every
+// user, root included. That is how this test expresses the one property the unit suite otherwise
+// cannot: the deployed operator runs on gcr.io/distroless/static with
+// securityContext.readOnlyRootFilesystem: true and no volume mounted at /tmp
+// (charts/alerts-operator/values.yaml, config/manager/manager.yaml), so os.TempDir() resolves to a
+// path it cannot write. A validation path that writes to disk passes on a developer's writable
+// machine and bricks every Tenant that sets spec.alertmanager.templatesRef in the shipped artifact.
+func readOnlyFilesystem(t *testing.T) {
+	t.Helper()
+	nowhere := filepath.Join(t.TempDir(), "no-such-dir")
+	for _, v := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(v, nowhere)
+	}
+	if _, err := os.MkdirTemp("", "probe-"); err == nil {
+		t.Fatalf("test setup is not actually read-only: MkdirTemp succeeded under TMPDIR=%s", nowhere)
+	}
+}
+
+// TestValidateAlertmanagerNeedsNoWritableFilesystem is the deployed-runtime test for the template
+// validation path: templates must be parsed without ever touching the filesystem.
+func TestValidateAlertmanagerNeedsNoWritableFilesystem(t *testing.T) {
+	readOnlyFilesystem(t)
+
+	in := fullInput()
+	if len(in.Templates) == 0 {
+		t.Fatal("fixture must carry templates or this test proves nothing")
+	}
+	cfg, err := Alertmanager(in)
+	if err != nil {
+		t.Fatalf("template validation must not require a writable filesystem: %v", err)
+	}
+	if !strings.Contains(cfg.Config, "templates:\n- default.tmpl") {
+		t.Fatalf("templates list missing:\n%s", cfg.Config)
+	}
+}
+
+// TestValidateAlertmanagerStillRejectsBrokenTemplatesOnReadOnlyFilesystem guards the other
+// direction: making the read-only case pass must not mean skipping template validation there.
+func TestValidateAlertmanagerStillRejectsBrokenTemplatesOnReadOnlyFilesystem(t *testing.T) {
+	readOnlyFilesystem(t)
+
+	in := fullInput()
+	in.Templates = map[string]string{"bad.tmpl": `{{ define "x" }}{{ .Unclosed `}
+	_, err := Alertmanager(in)
+	if err == nil || !strings.Contains(err.Error(), "templates") {
+		t.Fatalf("expected template parse error on a read-only filesystem, got %v", err)
 	}
 }

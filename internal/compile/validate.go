@@ -2,8 +2,8 @@ package compile
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	"sort"
+	"strings"
 
 	amconfig "github.com/prometheus/alertmanager/config"
 	amtemplate "github.com/prometheus/alertmanager/template"
@@ -13,46 +13,51 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
-// ValidateAlertmanager runs Alertmanager's own config loader on the compiled document and
-// parses the template files the same way Alertmanager does at startup (config.Load alone
-// does not touch templates). Template names are rewritten to real temp files first, scoped
-// strictly to the document's "templates" key: the document is unmarshaled into a generic map
-// and only that key is replaced, so a matcher, group_by label, or receiver name that happens to
-// equal a template name is never touched.
+// ValidateAlertmanager runs Alertmanager's own config loader on the compiled document and parses
+// the template bodies the same way Alertmanager does at startup (config.Load alone does not touch
+// templates).
+//
+// Everything here is in memory, deliberately: the operator's own container runs on
+// gcr.io/distroless/static with securityContext.readOnlyRootFilesystem: true and no volume mounted
+// at /tmp (charts/alerts-operator/values.yaml, config/manager/manager.yaml), so os.TempDir()
+// resolves to a path it cannot write. An earlier version wrote the template bodies to
+// os.MkdirTemp and handed the paths to template.FromGlobs, which is the only API that package
+// documents -- on the shipped artifact that mkdir fails, the failure is attributed to the
+// NotificationPolicy as a compile error, and syncAlertmanager then abandons the whole
+// Alertmanager document (receivers, routing tree, inhibit rules -- not just templates) before any
+// backend I/O. Neither half of what FromGlobs does needs a file:
+//
+//   - amconfig.Load parses YAML only. It is config.LoadFile, not Load, that resolves the
+//     "templates" entries against a base directory, so the compiled document's bare template names
+//     pass through Load untouched and no path rewriting is needed at all.
+//   - template.Template.Parse takes an io.Reader and is exactly what FromGlobs calls per file
+//     after ParseGlob. template.New installs the same DefaultFuncs FromGlobs relies on. The two
+//     embedded defaults FromGlobs parses first (default.tmpl, email.tmpl) are unreachable from
+//     here -- the embed.FS is unexported -- and are not needed: text/template resolves
+//     {{ template "name" }} references at execution time, not at parse time, so a user template
+//     referring to a default one parses identically with or without them.
+//
+// Templates are parsed in sorted name order so a document with several broken templates always
+// reports the same one.
 func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
-	text := cfg.Config
-	var paths []string
-	if len(cfg.TemplateFiles) > 0 {
-		dir, err := os.MkdirTemp("", "am-templates-")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup of a temp dir
-
-		var doc map[string]any
-		if err := yaml.Unmarshal([]byte(text), &doc); err != nil {
-			return fmt.Errorf("alertmanager config: %w", err)
-		}
-		for name, body := range cfg.TemplateFiles {
-			p := filepath.Join(dir, name)
-			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-				return err
-			}
-			paths = append(paths, p)
-		}
-		doc["templates"] = paths
-		raw, err := yaml.Marshal(doc)
-		if err != nil {
-			return fmt.Errorf("alertmanager config: %w", err)
-		}
-		text = string(raw)
-	}
-	if _, err := amconfig.Load(text); err != nil {
+	if _, err := amconfig.Load(cfg.Config); err != nil {
 		return fmt.Errorf("alertmanager config: %w", err)
 	}
-	if len(paths) > 0 {
-		if _, err := amtemplate.FromGlobs(paths); err != nil {
-			return fmt.Errorf("alertmanager templates: %w", err)
+	if len(cfg.TemplateFiles) == 0 {
+		return nil
+	}
+	tmpl, err := amtemplate.New()
+	if err != nil {
+		return fmt.Errorf("alertmanager templates: %w", err)
+	}
+	names := make([]string, 0, len(cfg.TemplateFiles))
+	for name := range cfg.TemplateFiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := tmpl.Parse(strings.NewReader(cfg.TemplateFiles[name])); err != nil {
+			return fmt.Errorf("alertmanager templates: %s: %w", name, err)
 		}
 	}
 	return nil
