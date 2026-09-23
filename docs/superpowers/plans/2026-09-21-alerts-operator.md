@@ -16,8 +16,21 @@
 - `Tenant` is cluster-scoped. `ContactPoint`, `NotificationPolicy`, `AlertRuleGroup` are namespaced.
 - Only the Tenant reconciler may call a backend. Children never write to backends and carry no finalizers.
 - Every backend request carries `X-Scope-OrgID: <spec.tenantId>`.
-- Rule namespaces are `<rulesNamespacePrefix>/<k8s-namespace>/<name>`; default prefix `alerts-operator`. Path segments must be `url.PathEscape`d.
-- Loki ruler: never call per-group `GET /loki/api/v1/rules/{ns}/{group}` (malformed 404 on Loki 3.6.7). Bulk `GET /loki/api/v1/rules` only.
+- Rule namespaces differ by backend: Mimir joins `<rulesNamespacePrefix>/<k8s-namespace>/<name>` (its ruler
+  routes on the raw, still-escaped path, so an embedded `/` is fine and this is verified working live); Loki
+  joins `<rulesNamespacePrefix>_<k8s-namespace>_<name>` (its ruler routes on the *decoded* path, so a `/` —
+  even URL-escaped as `%2F` — becomes a path-segment boundary and every per-namespace route 404s; verified
+  live: `POST /loki/api/v1/rules/flatns` → 202, `POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm` → 404). Default
+  prefix `alerts-operator`; `rulesNamespacePrefix` is pattern-restricted to `^[A-Za-z0-9.-]+$` (no `_`) so the
+  Loki separator is always unambiguous and the ownership prefix match lands on a true segment boundary — see
+  Task 3. Every namespace is built through one helper, `compile.BackendNamespace(be, prefix, k8sNamespace,
+  name)`, never two per-backend helpers: passing the backend explicitly means the separator is decided in
+  exactly one place and every call site is a compile error if the signature changes. Path segments must still
+  be `url.PathEscape`d for Mimir.
+- Loki ruler: per-group `GET /loki/api/v1/rules/{ns}/{group}` works fine on Loki 3.6.7 (verified 200) — an
+  earlier belief that it returned a malformed 404 was a misdiagnosis of the embedded-`/` problem above. The
+  operator still reads only the bulk `GET /loki/api/v1/rules`, because one read covers the whole diff, not
+  because the per-group route is broken.
 - `DELETE /api/v1/alerts` only inside the Tenant finalizer.
 - Secrets in CRs only via `secretKeyRef` into the CR's own namespace. No inline secrets.
 - No admission webhooks. Validation = CEL markers + reconcile-time checks.
@@ -531,7 +544,12 @@ type TenantSpec struct {
 	// +optional
 	Alertmanager *AlertmanagerSpec `json:"alertmanager,omitempty"`
 	// RulesNamespacePrefix scopes which backend rule namespaces this operator owns. Default "alerts-operator".
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.-]+$`
+	// "_" is excluded from the pattern on purpose: a Loki rule namespace is joined with "_"
+	// (compile.BackendNamespace), and a Kubernetes namespace or object name can never contain "_", so
+	// "_" is an unambiguous separator only as long as the prefix has none either. Allowing "_" here
+	// would let prefix "team" swallow every namespace of prefix "team_a" and prune them (the prune's
+	// ownership match, compile.OwnsNamespace, is a segment-boundary prefix match, not exact-prefix).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9.-]+$`
 	// +optional
 	RulesNamespacePrefix string `json:"rulesNamespacePrefix,omitempty"`
 	// ResyncInterval is the drift-repair period. Default 5m.
@@ -744,7 +762,9 @@ type AlertRuleGroupStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// BackendNamespace is the rule namespace used in the backend, <prefix>/<namespace>/<name>.
+	// BackendNamespace is the rule namespace used in the backend: <prefix>/<namespace>/<name> for
+	// backend mimir, <prefix>_<namespace>_<name> for backend loki (Loki's ruler rejects a namespace
+	// containing "/"; see compile.BackendNamespace).
 	// +optional
 	BackendNamespace string `json:"backendNamespace,omitempty"`
 }
@@ -1680,7 +1700,18 @@ func (s *Server) RejectPost(msg string) // POSTs return 400 msg until RejectPost
 func (s *Server) Requests() []string   // "METHOD path" log
 func (s *Server) ResetRequests()
 ```
-Paths served: Mimir `/prometheus/config/v1/rules[/{ns}[/{group}]]`, `/api/v1/alerts`; Loki `/loki/api/v1/rules[/{ns}[/{group}]]`. Mimir and Loki rules live in **separate** maps so one server can stand in for both backends of a Tenant without the two syncs pruning each other. Loki per-group GET deliberately returns 404 with a non-JSON body to mirror Loki 3.6.7. State keyed by `X-Scope-OrgID`; missing header → 401.
+Paths served: Mimir `/prometheus/config/v1/rules[/{ns}[/{group}]]`, `/api/v1/alerts`; Loki `/loki/api/v1/rules[/{ns}[/{group}]]`. Mimir and Loki rules live in **separate** maps so one server can stand in for both backends of a Tenant without the two syncs pruning each other. State keyed by `X-Scope-OrgID`; missing header → 401.
+
+Loki routing mirrors Loki 3.6.7's real HTTP router, not a blanket per-group special case: Mimir splits
+the escaped path into segments (an embedded `/` inside one segment, still `%2F`, stays inside it), but
+Loki decodes first — `%2F` becomes a literal `/` and counts as a path-segment boundary. So on Loki: a
+namespace with two or more embedded slashes decodes to 3+ segments, matches no registered route, and
+404s on every verb (POST/DELETE/GET alike); a namespace with exactly one embedded slash decodes to 2
+segments and collides with the `{namespace}/{group}` route, so POST there is a 405, not a 202; and a
+slash-free namespace works end to end, *including* per-group GET, which returns 200 — the project
+previously and wrongly believed that route was broken on 3.6.7 (alerts-operator-b4o: the embedded slash
+was always the sole cause, not the per-group route). The store can still hold a namespace with a slash
+(written outside this API); bulk GET must still list it even though no per-namespace route can reach it.
 
 - [ ] **Step 1: Failing test**
 
@@ -1733,19 +1764,58 @@ func TestFakeMimirRulesRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFakeLokiPerGroupGetIsBroken(t *testing.T) {
+// TestFakeLokiRejectsEmbeddedSlashInNamespace models the real defect behind alerts-operator-b4o.
+// Loki's ruler HTTP router matches on the DECODED path, so %2F becomes a path-segment boundary and
+// a namespace with an embedded slash produces more segments than any registered pattern has: the
+// route simply does not exist and Loki answers 404. Verified against live Loki 3.6.7:
+// POST /loki/api/v1/rules/flatns -> 202, POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm -> 404.
+func TestFakeLokiRejectsEmbeddedSlashInNamespace(t *testing.T) {
+	s := New()
+	defer s.Close()
+	body := "name: g\nrules:\n- alert: A\n  expr: '{job=\"x\"} |= \"err\"'\n"
+
+	// Two embedded slashes: 3 decoded segments, no route at all -> 404 on every verb.
+	for _, m := range []string{"POST", "DELETE", "GET"} {
+		if code, _ := do(t, m, s.URL+"/loki/api/v1/rules/p%2Fns%2Fa", body); code != 404 {
+			t.Fatalf("%s on a slash-containing loki namespace must 404, got %d", m, code)
+		}
+	}
+	// One embedded slash: 2 decoded segments, which collides with the {namespace}/{group} route --
+	// POST is not registered there, so Loki answers 405, not 202.
+	if code, _ := do(t, "POST", s.URL+"/loki/api/v1/rules/p%2Fns", body); code != 405 {
+		t.Fatalf("a one-slash loki namespace must hit the {ns}/{group} route (405), got %d", code)
+	}
+	if len(s.LokiRules("1")) != 0 {
+		t.Fatalf("nothing may be stored for a rejected namespace: %+v", s.LokiRules("1"))
+	}
+
+	// A slash-free namespace -- the scheme the operator now uses -- works end to end, including the
+	// per-group GET that the project previously (and wrongly) believed was broken on 3.6.7.
+	if code, _ := do(t, "POST", s.URL+"/loki/api/v1/rules/p_ns_a", body); code != 202 {
+		t.Fatalf("slash-free POST %d", code)
+	}
+	if code, b := do(t, "GET", s.URL+"/loki/api/v1/rules/p_ns_a/g", ""); code != 200 || !strings.Contains(b, "name: g") {
+		t.Fatalf("per-group GET on a slash-free namespace must work: %d %q", code, b)
+	}
+	if code, _ := do(t, "DELETE", s.URL+"/loki/api/v1/rules/p_ns_a", ""); code != 202 {
+		t.Fatalf("slash-free DELETE %d", code)
+	}
+}
+
+// TestFakeLokiBulkGetSeesSlashNamespaces: the *store* can still hold a namespace with a slash (one
+// written outside this API, or by an older/other tool). Only the per-namespace routes are
+// unreachable, so bulk GET must still list it -- the operator's prune has to be able to see, and
+// deliberately not claim, such a namespace.
+func TestFakeLokiBulkGetSeesSlashNamespaces(t *testing.T) {
 	s := New()
 	defer s.Close()
 	s.SetLokiRules("1", "p/ns/a", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "A", Expr: `{job="x"} |= "err"`}}}})
 	if len(s.Rules("1")) != 0 {
 		t.Fatal("loki seed must not appear in the mimir map")
 	}
-	code, body := do(t, "GET", s.URL+"/loki/api/v1/rules/p%2Fns%2Fa/g", "")
-	if code != 404 || body == "" {
-		t.Fatalf("expected malformed 404, got %d %q", code, body)
-	}
-	if code, _ = do(t, "GET", s.URL+"/loki/api/v1/rules", ""); code != 200 {
-		t.Fatalf("bulk get %d", code)
+	code, body := do(t, "GET", s.URL+"/loki/api/v1/rules", "")
+	if code != 200 || !strings.Contains(body, "p/ns/a:") {
+		t.Fatalf("bulk get %d %q", code, body)
 	}
 }
 
@@ -1954,7 +2024,8 @@ func (s *Server) handleAM(w http.ResponseWriter, r *http.Request, st *tenantStat
 	}
 }
 
-// segments splits "/ns/group" (escaped) into decoded parts.
+// segments splits "/ns/group" into decoded parts the way Mimir's ruler routes: on the raw, still-
+// escaped path, so an escaped "/" inside one segment stays inside it.
 func segments(rest string) []string {
 	rest = strings.Trim(rest, "/")
 	if rest == "" {
@@ -1969,12 +2040,40 @@ func segments(rest string) []string {
 	return parts
 }
 
+// decodedSegments splits on the DECODED path, the way Loki's ruler routes: %2F is turned back into
+// a literal "/" before pattern matching, so it counts as a path-segment boundary. This is what makes
+// a namespace with an embedded slash unaddressable on Loki (alerts-operator-b4o).
+func decodedSegments(rest string) []string {
+	if u, err := unescape(rest); err == nil {
+		rest = u
+	}
+	rest = strings.Trim(rest, "/")
+	if rest == "" {
+		return nil
+	}
+	return strings.Split(rest, "/")
+}
+
 func unescape(s string) (string, error) {
 	return url.PathUnescape(s)
 }
 
 func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[string][]backend.RuleGroup, rest string, loki bool) {
 	seg := segments(rest)
+	if loki {
+		// Loki routes on the decoded path (see decodedSegments): a namespace containing "/" yields
+		// more segments than any registered pattern has, so no route matches and the ruler answers a
+		// bare 404 -- for POST, DELETE and GET alike. Verified against live Loki 3.6.7:
+		// POST /loki/api/v1/rules/flatns -> 202, POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm -> 404.
+		// A namespace with exactly one embedded slash decodes to two segments and so collides with
+		// the {namespace}/{group} route instead, which is why POST there answers 405: that fallthrough
+		// is reproduced by simply routing on the decoded segments below.
+		seg = decodedSegments(rest)
+		if len(seg) > 2 {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	switch {
 	case r.Method == http.MethodGet && len(seg) == 0:
 		if len(rules) == 0 {
@@ -1993,12 +2092,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[s
 		b, _ := yaml.Marshal(map[string][]backend.RuleGroup{seg[0]: gs})
 		_, _ = w.Write(b)
 	case r.Method == http.MethodGet && len(seg) == 2:
-		if loki {
-			// Mirrors Loki 3.6.7: per-group GET is broken and returns a malformed 404.
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte("<html>not found</html>"))
-			return
-		}
+		// Loki's per-group GET is not special-cased: on a slash-free namespace it works exactly like
+		// Mimir's (verified GET=200 on live Loki 3.6.7). The operator still only ever uses the bulk
+		// GET -- see internal/backend/loki -- but for sufficiency, not because this route is broken.
 		for _, g := range rules[seg[0]] {
 			if g.Name == seg[1] {
 				b, _ := yaml.Marshal(g)
@@ -2244,23 +2340,30 @@ import (
 	"github.com/antnsn/alerts-operator/internal/backend/fake"
 )
 
-func TestClientNeverUsesPerGroupGet(t *testing.T) {
+// TestClientReadsOnlyInBulk: the reconciler diffs from one bulk GET, so the client must never
+// issue a per-namespace or per-group GET. That is a sufficiency choice (one read covers the whole
+// diff), not a workaround for a broken route -- per-group GET is verified working on Loki 3.6.7.
+//
+// The namespace here uses the "_" scheme the operator actually writes; the loop also asserts no
+// request path carries an escaped slash, which is what Loki's router rejects (alerts-operator-b4o).
+func TestClientReadsOnlyInBulk(t *testing.T) {
 	s := fake.New()
 	defer s.Close()
 	c := New(backend.Options{Address: s.URL, TenantID: "1"})
 	ctx := context.Background()
+	const ns = "alerts-operator_ns_l"
 	g := backend.RuleGroup{Name: "g", Rules: []backend.Rule{{Alert: "E", Expr: `sum(rate({job="x"} |= "error" [5m])) > 0`}}}
-	if err := c.SetGroup(ctx, "alerts-operator/ns/l", g); err != nil {
+	if err := c.SetGroup(ctx, ns, g); err != nil {
 		t.Fatal(err)
 	}
 	got, err := c.List(ctx)
-	if err != nil || got["alerts-operator/ns/l"][0].Name != "g" {
+	if err != nil || got[ns][0].Name != "g" {
 		t.Fatalf("list: %+v %v", got, err)
 	}
-	if err := c.DeleteGroup(ctx, "alerts-operator/ns/l", "g"); err != nil {
+	if err := c.DeleteGroup(ctx, ns, "g"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.DeleteNamespace(ctx, "alerts-operator/ns/l"); err != nil {
+	if err := c.DeleteNamespace(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range s.Requests() {
@@ -2269,6 +2372,9 @@ func TestClientNeverUsesPerGroupGet(t *testing.T) {
 		}
 		if !strings.Contains(r, "/loki/api/v1/rules") {
 			t.Fatalf("wrong base path: %s", r)
+		}
+		if strings.Contains(strings.ToUpper(r), "%2F") {
+			t.Fatalf("a Loki request path must never carry an escaped slash: %s", r)
 		}
 	}
 	got, err = c.List(ctx)
@@ -2290,8 +2396,17 @@ Expected: FAIL.
 ```go
 // Package loki talks to the Grafana Loki ruler API.
 //
-// Only the bulk GET /loki/api/v1/rules is used for reads: on Loki 3.6.7 the
-// per-group GET returns a malformed 404.
+// Only the bulk GET /loki/api/v1/rules is used for reads. This is a sufficiency
+// choice, not a workaround: one bulk read gives the reconciler everything it
+// diffs, and it is the read path proven against the live cluster. The per-group
+// GET /loki/api/v1/rules/{ns}/{group} works fine (verified 200 on Loki 3.6.7);
+// an earlier belief that it returned a malformed 404 was a misdiagnosis of
+// alerts-operator-b4o.
+//
+// What Loki's ruler really rejects is an embedded "/" in the namespace: its
+// router matches on the decoded path, so %2F becomes a path-segment boundary
+// and every per-namespace route 404s. Rule namespaces for Loki are therefore
+// joined with "_" -- see compile.BackendNamespace.
 package loki
 
 import (
@@ -2353,10 +2468,27 @@ git commit -m "feat(backend): Loki ruler client using bulk GET only"
 - Produces:
 ```go
 package compile
-func BackendNamespace(prefix, k8sNamespace, name string) string          // prefix + "/" + ns + "/" + name
-func Rules(prefix string, groups []v1alpha1.AlertRuleGroup) map[string][]backend.RuleGroup
+func NamespaceSeparator(be v1alpha1.Backend) string                              // "/" for mimir, "_" for loki
+func BackendNamespace(be v1alpha1.Backend, prefix, k8sNamespace, name string) string  // prefix + sep + ns + sep + name
+func OwnedNamespacePrefix(be v1alpha1.Backend, prefix string) string             // prefix + that backend's separator
+func OwnsNamespace(be v1alpha1.Backend, prefix, ns string) bool                  // segment-boundary match, never bare HasPrefix
+func Rules(be v1alpha1.Backend, prefix string, groups []v1alpha1.AlertRuleGroup) map[string][]backend.RuleGroup
 func RulesEqual(a, b []backend.RuleGroup) bool                           // order-insensitive by group name, deep-equal content
 ```
+The backend is an explicit parameter on every one of these, never two per-backend helpers: the separator is
+decided in exactly one place, and any call site that only had the k8s coordinates could not silently pick
+the wrong scheme. This is also how the fix for alerts-operator-b4o found its complete call-site list — the
+signature change was a compile error everywhere a namespace was built.
+
+Mimir joins segments with `/` (its ruler routes on the raw, still-escaped path, so an embedded `/` is a
+single path segment and this is verified working live). Loki joins with `_` (its ruler routes on the
+*decoded* path, so a `/` — even as `%2F` — becomes a path-segment boundary and every per-namespace route
+404s; verified live: `POST /loki/api/v1/rules/flatns` → 202, `POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm` →
+404). `_` specifically, not `-` or `.`: a Kubernetes namespace or object name can contain `-` and `.`
+freely but never `_`, and Task 3's CRD pattern excludes `_` from the prefix too — that combination is what
+keeps `<prefix>_<ns>_<name>` unambiguous and makes `OwnsNamespace`'s prefix match land on a true segment
+boundary. Loosen that pattern and a Tenant with prefix `team` would own (and prune) every namespace of a
+Tenant with prefix `team_a`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -2369,6 +2501,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2409,15 +2542,93 @@ func TestRulesGolden(t *testing.T) {
 			{Name: "udm", Rules: []v1alpha1.Rule{{Alert: "UDMErrors", Expr: `sum(rate({host="udm"} |= "error" [5m])) > 1`, KeepFiringFor: "10m"}}},
 		}}},
 	}
-	got := Rules("alerts-operator", in)
+	// Rules is per-backend: the caller filters by backend first, and the namespace scheme differs
+	// between them (Mimir joins on "/", Loki on "_" -- see BackendNamespace). The golden holds both
+	// results merged so the two schemes are visible side by side; the keys can never collide,
+	// because a Kubernetes name contains neither separator.
+	got := map[string][]backend.RuleGroup{}
+	for ns, gs := range Rules(v1alpha1.BackendMimir, "alerts-operator", in[:1]) {
+		got[ns] = gs
+	}
+	for ns, gs := range Rules(v1alpha1.BackendLoki, "alerts-operator", in[1:]) {
+		got[ns] = gs
+	}
 	if len(got) != 2 {
 		t.Fatalf("namespaces: %v", got)
 	}
 	if _, ok := got["alerts-operator/monitoring/homelab"]; !ok {
-		t.Fatalf("missing namespace: %v", got)
+		t.Fatalf("missing mimir namespace: %v", got)
+	}
+	if _, ok := got["alerts-operator_loki_udm"]; !ok {
+		t.Fatalf("missing loki namespace: %v", got)
 	}
 	b, _ := yaml.Marshal(got)
 	golden(t, "rules_basic.golden.yaml", b)
+}
+
+// TestLokiBackendNamespaceNeverContainsSlash is the regression test for alerts-operator-b4o, the
+// defect that made the Loki backend inert on a real cluster: Loki's ruler HTTP router treats every
+// literal "/" as a path-segment boundary, so it 404s on every per-namespace route
+// (POST/DELETE/per-group GET) whose namespace contains an embedded slash -- even URL-escaped as
+// %2F. Verified against live Loki 3.6.7: POST /loki/api/v1/rules/flatns -> 202,
+// POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm -> 404.
+func TestLokiBackendNamespaceNeverContainsSlash(t *testing.T) {
+	for _, c := range []struct{ prefix, ns, name string }{
+		{"alerts-operator", "monitoring", "homelab"},
+		{v1alpha1.DefaultRulesNamespacePrefix, "e2e", "udm"},
+		{"a.b-c", "kube-system", "node.rules"},
+	} {
+		got := BackendNamespace(v1alpha1.BackendLoki, c.prefix, c.ns, c.name)
+		if strings.Contains(got, "/") {
+			t.Fatalf("a Loki rule namespace must never contain %q: got %q", "/", got)
+		}
+		if want := c.prefix + "_" + c.ns + "_" + c.name; got != want {
+			t.Fatalf("BackendNamespace(loki) = %q, want %q", got, want)
+		}
+	}
+	// Mimir is deliberately unchanged: its ruler handles embedded slashes and the scheme is
+	// verified working on a live cluster, so the narrow fix must not touch it.
+	if got, want := BackendNamespace(v1alpha1.BackendMimir, "alerts-operator", "monitoring", "homelab"), "alerts-operator/monitoring/homelab"; got != want {
+		t.Fatalf("BackendNamespace(mimir) = %q, want %q", got, want)
+	}
+}
+
+// TestOwnsNamespaceMatchesOnSegmentBoundary guards the prune and the finalizer: ownership is a
+// prefix match on a *segment boundary* with the separator of the backend in question. A bare
+// strings.HasPrefix(ns, "alerts-operator") would also claim "alerts-operator-other_..." and delete
+// somebody else's live rules.
+func TestOwnsNamespaceMatchesOnSegmentBoundary(t *testing.T) {
+	for _, c := range []struct {
+		be   v1alpha1.Backend
+		ns   string
+		want bool
+	}{
+		{v1alpha1.BackendMimir, "alerts-operator/default/x", true},
+		{v1alpha1.BackendMimir, "alerts-operator-other/default/x", false},
+		{v1alpha1.BackendMimir, "alerts-operator", false},
+		{v1alpha1.BackendMimir, "alerts-operator_default_x", false}, // a Loki-shaped name is not a Mimir one
+		{v1alpha1.BackendLoki, "alerts-operator_default_x", true},
+		{v1alpha1.BackendLoki, "alerts-operator-other_default_x", false},
+		{v1alpha1.BackendLoki, "alerts-operator", false},
+		{v1alpha1.BackendLoki, "alerts-operator/default/x", false}, // a Mimir-shaped name is not a Loki one
+	} {
+		if got := OwnsNamespace(c.be, "alerts-operator", c.ns); got != c.want {
+			t.Fatalf("OwnsNamespace(%s, %q) = %v, want %v", c.be, c.ns, got, c.want)
+		}
+	}
+}
+
+// TestLokiOwnershipRequiresUnderscoreFreePrefix makes an otherwise invisible coupling explicit:
+// OwnsNamespace's segment-boundary match is only unambiguous because Tenant.spec.rulesNamespacePrefix
+// cannot contain "_" (Task 3's CRD pattern). If it could, a Tenant with prefix "team" would own every
+// namespace of a Tenant with prefix "team_a" -- and would prune them, since conflictingTenant compares
+// prefixes for equality and would not see the two as colliding. Loosening that pattern without reading
+// this test is exactly how the hazard comes back.
+func TestLokiOwnershipRequiresUnderscoreFreePrefix(t *testing.T) {
+	if !OwnsNamespace(v1alpha1.BackendLoki, "team", "team_a_default_x") {
+		t.Fatal("precondition changed: prefix \"team\" no longer swallows a \"team_a\" namespace; " +
+			"if OwnsNamespace now parses segments, revisit whether rulesNamespacePrefix still needs to forbid \"_\"")
+	}
 }
 
 func TestRulesEqualIgnoresOrder(t *testing.T) {
@@ -2455,21 +2666,81 @@ package compile
 import (
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
-// BackendNamespace is the ruler namespace owned by one AlertRuleGroup.
-func BackendNamespace(prefix, k8sNamespace, name string) string {
-	return prefix + "/" + k8sNamespace + "/" + name
+const (
+	// mimirSeparator joins the segments of a Mimir rule namespace. Mimir's ruler routes on the raw,
+	// still-escaped path, so a namespace containing "/" is addressable as a single path segment and
+	// this scheme is verified working against a live cluster.
+	mimirSeparator = "/"
+	// lokiSeparator joins the segments of a Loki rule namespace.
+	//
+	// It is NOT "/": Loki's ruler HTTP router treats every literal "/" as a path-segment boundary,
+	// so once net/http has decoded %2F back into "/" the path has more segments than the registered
+	// pattern expects and every per-namespace route 404s. Verified against live Loki 3.6.7:
+	// POST /loki/api/v1/rules/flatns -> 202, POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm -> 404
+	// (alerts-operator-b4o). With "/" no AlertRuleGroup could ever sync to Loki.
+	//
+	// "_" specifically, rather than "-" or ".": a Kubernetes namespace or object name can contain
+	// "-" and "." freely, so those would make <prefix><sep><namespace><sep><name> ambiguous, while
+	// "_" is forbidden in both. Tenant.spec.rulesNamespacePrefix is pattern-restricted to exclude
+	// "_" as well (api/v1alpha1/tenant_types.go), which is what makes the separator unambiguous
+	// from the first segment onward -- and makes the ownership prefix below a true segment boundary.
+	lokiSeparator = "_"
+)
+
+// NamespaceSeparator returns the character that joins the segments of a rule namespace on backend
+// be. Mimir and Loki deliberately differ; see the constants above.
+//
+// Backend is a CEL-validated enum of exactly {mimir, loki}, so the default arm is unreachable for
+// any object the API server accepted. It resolves to Mimir's scheme rather than panicking because
+// this runs inside a reconcile loop: Mimir's separator is the historical one, so an impossible
+// value degrades to the pre-existing behaviour instead of crashing the manager.
+func NamespaceSeparator(be v1alpha1.Backend) string {
+	switch be {
+	case v1alpha1.BackendLoki:
+		return lokiSeparator
+	default:
+		return mimirSeparator
+	}
 }
 
-// Rules maps AlertRuleGroups to backend namespaces. The caller filters by backend first.
-func Rules(prefix string, groups []v1alpha1.AlertRuleGroup) map[string][]backend.RuleGroup {
+// BackendNamespace is the ruler namespace owned by one AlertRuleGroup on backend be.
+//
+// The backend is an explicit parameter rather than two per-backend helpers so that the separator is
+// decided in exactly one place and every call site has to name the backend it means: a call site
+// that only had the k8s coordinates could not silently pick the wrong scheme, and adding a third
+// backend would not mean auditing every caller for a missing variant.
+func BackendNamespace(be v1alpha1.Backend, prefix, k8sNamespace, name string) string {
+	sep := NamespaceSeparator(be)
+	return prefix + sep + k8sNamespace + sep + name
+}
+
+// OwnedNamespacePrefix is the string every rule namespace this operator owns under prefix on
+// backend be starts with: the prefix plus that backend's separator. Matching on it -- never on the
+// bare prefix -- is what keeps "alerts-operator" from claiming "alerts-operator-other_default_x".
+func OwnedNamespacePrefix(be v1alpha1.Backend, prefix string) string {
+	return prefix + NamespaceSeparator(be)
+}
+
+// OwnsNamespace reports whether the backend rule namespace ns belongs to prefix on backend be,
+// matched on a segment boundary. The prune loop (internal/controller/tenant_rules.go) and the
+// finalizer (internal/controller/tenant_finalizer.go) both gate deletes on it.
+func OwnsNamespace(be v1alpha1.Backend, prefix, ns string) bool {
+	return strings.HasPrefix(ns, OwnedNamespacePrefix(be, prefix))
+}
+
+// Rules maps AlertRuleGroups to backend namespaces on backend be. The caller filters by backend
+// first; be also decides the namespace scheme, so passing groups of the other backend would key
+// them under the wrong one.
+func Rules(be v1alpha1.Backend, prefix string, groups []v1alpha1.AlertRuleGroup) map[string][]backend.RuleGroup {
 	out := map[string][]backend.RuleGroup{}
 	for _, arg := range groups {
-		ns := BackendNamespace(prefix, arg.Namespace, arg.Name)
+		ns := BackendNamespace(be, prefix, arg.Namespace, arg.Name)
 		var gs []backend.RuleGroup
 		for _, g := range arg.Spec.Groups {
 			bg := backend.RuleGroup{Name: g.Name, Interval: g.Interval}
@@ -3831,6 +4102,33 @@ func TestAlertRuleGroupAccepted(t *testing.T) {
 	waitCondition(t, missing, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
 }
 
+// TestAlertRuleGroupBackendNamespaceIsPerBackend: status.backendNamespace is what an operator reads
+// to find the group in the ruler, so it must be spelled with the separator that backend actually
+// uses -- "/" on Mimir, "_" on Loki. A Loki value containing "/" would name a namespace Loki's
+// router cannot address at all (alerts-operator-b4o).
+func TestAlertRuleGroupBackendNamespaceIsPerBackend(t *testing.T) {
+	newFakeTenant(t, "arg-tenant-ns", true, true) // both backends configured
+
+	mimirARG := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "arg-ns-m", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: "arg-tenant-ns", Backend: "mimir", Groups: ruleGroups("up == 0")}}
+	lokiARG := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "arg-ns-l", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: "arg-tenant-ns", Backend: "loki", Groups: ruleGroups(`{job="x"} |= "e"`)}}
+	createAndCleanup(t, mimirARG)
+	createAndCleanup(t, lokiARG)
+	waitCondition(t, mimirARG, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+	waitCondition(t, lokiARG, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+
+	if got, want := mimirARG.Status.BackendNamespace, "alerts-operator/default/arg-ns-m"; got != want {
+		t.Fatalf("mimir backendNamespace = %q, want %q", got, want)
+	}
+	if got, want := lokiARG.Status.BackendNamespace, "alerts-operator_default_arg-ns-l"; got != want {
+		t.Fatalf("loki backendNamespace = %q, want %q", got, want)
+	}
+	if strings.Contains(lokiARG.Status.BackendNamespace, "/") {
+		t.Fatalf("a Loki backendNamespace must never contain %q: %q", "/", lokiARG.Status.BackendNamespace)
+	}
+}
+
 func findCond(obj observabilityv1alpha1.Conditioned, typ string) metav1.Condition {
 	for _, c := range obj.GetConditions() {
 		if c.Type == typ {
@@ -3898,7 +4196,7 @@ func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	case err != nil:
 		return ctrl.Result{}, err
 	default:
-		backendNS = compile.BackendNamespace(tenant.Prefix(), arg.Namespace, arg.Name)
+		backendNS = compile.BackendNamespace(arg.Spec.Backend, tenant.Prefix(), arg.Namespace, arg.Name)
 		switch {
 		case arg.Spec.Backend == v1alpha1.BackendMimir && tenant.Spec.Mimir == nil,
 			arg.Spec.Backend == v1alpha1.BackendLoki && tenant.Spec.Loki == nil:
@@ -4932,7 +5230,23 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenant *v1alpha1.Te
 				ch.LokiGroups = append(ch.LokiGroups, a)
 			}
 		case staleGeneration(&a):
-			ch.KeepNamespaces[compile.BackendNamespace(tenant.Prefix(), a.Namespace, a.Name)] = true
+			// Every backend's spelling of this child's namespace, not just spec.backend's.
+			//
+			// spec.backend is part of the spec, so an edit that switches an AlertRuleGroup from
+			// mimir to loki (or back) bumps Generation and makes spec.backend read as the NEW
+			// backend while Accepted still describes the old one. Keeping only the new backend's
+			// namespace would protect the one the group is moving *to* and leave the one it
+			// currently occupies unprotected: the old backend's prune would see a namespace under
+			// its prefix that nothing desires and delete live, firing rules before the edit has
+			// even been validated.
+			//
+			// The extra entry is free: keep only ever suppresses a prune, a name identifies exactly
+			// one child object in its namespace, and the entry for a backend the child does not use
+			// matches nothing in that backend's state -- so it cannot even set syncRules' `kept`
+			// flag spuriously.
+			for _, be := range []v1alpha1.Backend{v1alpha1.BackendMimir, v1alpha1.BackendLoki} {
+				ch.KeepNamespaces[compile.BackendNamespace(be, tenant.Prefix(), a.Namespace, a.Name)] = true
+			}
 		}
 	}
 	return ch, nil
@@ -5201,10 +5515,10 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
 	rules, lokiRules := srv.Rules("1"), srv.LokiRules("1")
-	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(lokiRules["alerts-operator/default/sync-l"]) != 1 || len(rules["other/x"]) != 1 {
+	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(lokiRules["alerts-operator_default_sync-l"]) != 1 || len(rules["other/x"]) != 1 {
 		t.Fatalf("rules in backend: mimir=%+v loki=%+v", rules, lokiRules)
 	}
-	if _, leaked := rules["alerts-operator/default/sync-l"]; leaked {
+	if _, leaked := rules["alerts-operator_default_sync-l"]; leaked {
 		t.Fatal("loki group must not be written to mimir")
 	}
 	am := srv.Alertmanager("1")
@@ -5255,7 +5569,7 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 	if err := testClient.Delete(testCtx, lokiG); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { _, ok := srv.LokiRules("1")["alerts-operator/default/sync-l"]; return !ok })
+	waitFor(t, func() bool { _, ok := srv.LokiRules("1")["alerts-operator_default_sync-l"]; return !ok })
 	if _, ok := srv.Rules("1")["other/x"]; !ok {
 		t.Fatal("foreign namespace was pruned")
 	}
@@ -5388,7 +5702,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -5412,8 +5725,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	if be == v1alpha1.BackendLoki {
 		condType = v1alpha1.ConditionLokiRulesSynced
 	}
-	prefix := tenant.Prefix() + "/"
-	desired := compile.Rules(tenant.Prefix(), groups)
+	desired := compile.Rules(be, tenant.Prefix(), groups)
 
 	actual, err := store.List(ctx)
 	if err != nil {
@@ -5472,7 +5784,11 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 		if keep[ns] {
 			continue
 		}
-		if _, wanted := desired[ns]; strings.HasPrefix(ns, prefix) && !wanted {
+		// compile.OwnsNamespace, never a bare strings.HasPrefix on the unslashed prefix: the match
+		// has to land on a segment boundary with *this backend's* separator ("/" for Mimir, "_" for
+		// Loki), or "alerts-operator" would also claim -- and delete -- "alerts-operator-other/..."
+		// or "alerts-operator-other_...".
+		if _, wanted := desired[ns]; compile.OwnsNamespace(be, tenant.Prefix(), ns) && !wanted {
 			if err := store.DeleteNamespace(ctx, ns); err != nil {
 				pruneErrs = append(pruneErrs, err)
 			}
@@ -5481,7 +5797,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 
 	var all []error
 	for i := range groups {
-		ns := compile.BackendNamespace(tenant.Prefix(), groups[i].Namespace, groups[i].Name)
+		ns := compile.BackendNamespace(be, tenant.Prefix(), groups[i].Namespace, groups[i].Name)
 		r.setChildSynced(ctx, &groups[i], nsErr[ns])
 		if nsErr[ns] != nil {
 			all = append(all, nsErr[ns])
@@ -5749,7 +6065,7 @@ var LastSyncTimestamp *prometheus.GaugeVec    // alerts_operator_last_sync_times
 func Observe(tenant, target string, err error)
 // internal/controller
 func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant) error
-func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, prefix string) error
+func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, be v1alpha1.Backend, prefix string) error
 ```
 
 - [ ] **Step 1: Failing tests**
@@ -5815,7 +6131,7 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 		createAndCleanup(t, o)
 	}
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
-	if srv.Alertmanager("1") == nil || len(srv.LokiRules("1")["alerts-operator/default/fin-g"]) != 1 {
+	if srv.Alertmanager("1") == nil || len(srv.LokiRules("1")["alerts-operator_default_fin-g"]) != 1 {
 		t.Fatal("precondition: backend populated")
 	}
 
@@ -5839,7 +6155,7 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 	if srv.Alertmanager("1") != nil {
 		t.Fatal("alertmanager config not deleted")
 	}
-	if _, ok := srv.LokiRules("1")["alerts-operator/default/fin-g"]; ok {
+	if _, ok := srv.LokiRules("1")["alerts-operator_default_fin-g"]; ok {
 		t.Fatal("owned loki namespace not deleted")
 	}
 	if _, ok := srv.Rules("1")["other/x"]; !ok {
@@ -5924,16 +6240,15 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
+	"github.com/antnsn/alerts-operator/internal/compile"
 )
 
 // finalize removes everything this tenant owns in its backends: the Alertmanager config
 // and every rule namespace under the tenant prefix. Any failure keeps the finalizer.
 func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant) error {
-	prefix := tenant.Prefix() + "/"
 	if tenant.Spec.Mimir != nil {
 		mc, err := r.mimirClient(ctx, tenant)
 		if err != nil {
@@ -5942,7 +6257,7 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 		if err := mc.Delete(ctx); err != nil {
 			return fmt.Errorf("delete alertmanager config: %w", err)
 		}
-		if err := deleteOwnedNamespaces(ctx, mc, prefix); err != nil {
+		if err := deleteOwnedNamespaces(ctx, mc, v1alpha1.BackendMimir, tenant.Prefix()); err != nil {
 			return fmt.Errorf("mimir rules: %w", err)
 		}
 	}
@@ -5951,21 +6266,27 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 		if err != nil {
 			return fmt.Errorf("loki client: %w", err)
 		}
-		if err := deleteOwnedNamespaces(ctx, lc, prefix); err != nil {
+		if err := deleteOwnedNamespaces(ctx, lc, v1alpha1.BackendLoki, tenant.Prefix()); err != nil {
 			return fmt.Errorf("loki rules: %w", err)
 		}
 	}
 	return nil
 }
 
-// deleteOwnedNamespaces deletes every rule namespace starting with prefix.
-func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, prefix string) error {
+// deleteOwnedNamespaces deletes every rule namespace owned by prefix on backend be. Ownership is
+// compile.OwnsNamespace -- a segment-boundary match on prefix + that backend's separator, never a
+// bare strings.HasPrefix on the unslashed prefix -- which keeps "alerts-operator" from claiming a
+// differently-owned "alerts-operator-other/..." (Mimir) or "alerts-operator-other_..." (Loki).
+//
+// be is passed explicitly rather than inferred from store's concrete type: the separator must be
+// stated by the caller that knows which backend it is finalizing.
+func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, be v1alpha1.Backend, prefix string) error {
 	actual, err := store.List(ctx)
 	if err != nil {
 		return err
 	}
 	for ns := range actual {
-		if strings.HasPrefix(ns, prefix) {
+		if compile.OwnsNamespace(be, prefix, ns) {
 			if err := store.DeleteNamespace(ctx, ns); err != nil {
 				return err
 			}
@@ -6889,9 +7210,11 @@ Verify *(cluster command)*:
 ```bash
 kubectl get alertrulegroups -n monitoring
 curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep '^alerts-operator/'
-curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator/'
+curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator_'
 ```
-Expected: `Accepted=True Synced=True` for all; namespaces `alerts-operator/monitoring/homelab`, `alerts-operator/monitoring/loki-homelab`, `alerts-operator/monitoring/loki-udm`.
+Expected: `Accepted=True Synced=True` for all; Mimir namespace `alerts-operator/monitoring/homelab`, Loki
+namespaces `alerts-operator_monitoring_loki-homelab`, `alerts-operator_monitoring_loki-udm` (Loki joins on
+`_`; its ruler rejects a namespace containing `/` — alerts-operator-b4o).
 
 At this point Mimir has the rules twice (Alloy `homelab/*` and operator `alerts-operator/*`). Alerts fire twice until step 5. Do step 5 the same day.
 
@@ -6906,7 +7229,7 @@ Verify: `kubectl get ns mimir-sync` → NotFound; Alloy pod restarted and logs s
 
 ## 6. Prune old backend state (manual, once)
 
-Alloy's prefix and mimir-sync's namespaces are outside `alerts-operator/`, so the operator never touches them.
+Alloy's prefix and mimir-sync's namespaces are outside `alerts-operator/` (Mimir) and `alerts-operator_` (Loki), so the operator never touches them.
 
 ```bash
 # tenant 1 — Alloy-owned namespaces
@@ -6922,7 +7245,7 @@ curl -s -X DELETE -H 'X-Scope-OrgID: anonymous' $M/prometheus/config/v1/rules/de
 curl -s -X DELETE -H 'X-Scope-OrgID: anonymous' $M/api/v1/alerts
 ```
 
-Verify: `GET /prometheus/config/v1/rules` for tenant `1` lists only `alerts-operator/*`; for `anonymous` returns 404; Loki lists only `alerts-operator/*`.
+Verify: `GET /prometheus/config/v1/rules` for tenant `1` lists only `alerts-operator/*`; for `anonymous` returns 404; Loki lists only `alerts-operator_*`.
 
 ## 7. Prove alerting end to end
 
@@ -6976,7 +7299,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 | `Tenant` | cluster | Backend addresses, `tenantId` (`X-Scope-OrgID`), optional auth, template ConfigMap, rule-namespace prefix, resync interval. Single writer to Mimir/Loki. |
 | `ContactPoint` | namespaced | Alertmanager receiver(s): webhook, pushover, slack, discord, telegram, email. Secrets only via `secretKeyRef` in the same namespace. Becomes receiver `<namespace>/<name>`. |
 | `NotificationPolicy` | namespaced | Alertmanager route tree + inhibit rules. One per Tenant (oldest wins). `receiver` names are ContactPoints in the same namespace. |
-| `AlertRuleGroup` | namespaced | PrometheusRule-shaped groups for `backend: mimir` or `backend: loki`. Lands in backend namespace `<prefix>/<namespace>/<name>`. |
+| `AlertRuleGroup` | namespaced | PrometheusRule-shaped groups for `backend: mimir` or `backend: loki`. Lands in backend namespace `<prefix>/<namespace>/<name>` (Mimir) or `<prefix>_<namespace>_<name>` (Loki — its ruler rejects a namespace containing `/`). |
 
 ## Status conditions
 
@@ -6990,7 +7313,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 
 ## Guarantees and limits
 
-- Prunes only backend rule namespaces under `<prefix>/`. Everything else in the tenant is left alone.
+- Prunes only backend rule namespaces under `<prefix>/` (Mimir) / `<prefix>_` (Loki), matched on that segment boundary. Everything else in the tenant is left alone.
 - Deleting a `Tenant` deletes its Alertmanager config and all rule namespaces under its prefix (finalizer).
 - No Tempo support: alert on Tempo metrics-generator series via Mimir rules.
 - No mute timings, no cross-namespace references (v1).
@@ -7326,9 +7649,9 @@ Y
 ## 4. Rules
 
 - [ ] `sed 's/namespace: monitoring/namespace: e2e/; s/tenantRef: homelab/tenantRef: e2e/' docs/examples/alertrulegroup-mimir.yaml docs/examples/alertrulegroup-loki.yaml | kubectl apply -f -`
-- [ ] `kubectl -n e2e get alertrulegroups` → `Accepted=True Synced=True`; `.status.backendNamespace` = `e2e/e2e/homelab` and `e2e/e2e/udm`.
+- [ ] `kubectl -n e2e get alertrulegroups` → `Accepted=True Synced=True`; `.status.backendNamespace` = `e2e/e2e/homelab` (mimir) and `e2e_e2e_udm` (loki — its ruler rejects a namespace containing `/`; alerts-operator-b4o).
 - [ ] `mcurl -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules | grep '^e2e/'` → `e2e/e2e/homelab:`.
-- [ ] `mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep '^e2e/'` → `e2e/e2e/udm:`.
+- [ ] `mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep '^e2e_'` → `e2e_e2e_udm:`.
 - [ ] Negative: patch bad PromQL: `kubectl -n e2e patch alertrulegroup homelab --type=json -p '[{"op":"replace","path":"/spec/groups/0/rules/0/expr","value":"up{job=\\""}]'` → `Accepted=False/InvalidRule`, message names group `node.health` rule `0`. Revert with the apply above.
 - [ ] Drift repair: `mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$M/prometheus/config/v1/rules/e2e%2Fe2e%2Fhomelab"`; within `resyncInterval` (1m) the namespace is back.
 
@@ -7367,7 +7690,7 @@ Y
 
 ## 7. Teardown
 
-- [ ] `kubectl delete tenant e2e` → object gone within 10s (the finalizer deletes tenant `e2e`'s Alertmanager config and every `e2e/*` rule namespace in both backends).
+- [ ] `kubectl delete tenant e2e` → object gone within 10s (the finalizer deletes tenant `e2e`'s Alertmanager config and every `e2e/*` (mimir) / `e2e_*` (loki) rule namespace).
 - [ ] Verify: `mcurl -o /dev/null -w '%{http_code}\n' -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules` → `404`; same for `$L/loki/api/v1/rules`; `mcurl -o /dev/null -w '%{http_code}\n' -H 'X-Scope-OrgID: e2e' $M/api/v1/alerts` → `404`.
 - [ ] Fallback if the Tenant is stuck (backend down during delete) and you must clean up by hand:
 
@@ -7376,7 +7699,7 @@ mcurl -X DELETE -H 'X-Scope-OrgID: e2e' $M/api/v1/alerts
 for ns in $(mcurl -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules | grep -E '^e2e/' | sed 's/:$//'); do
   mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$M/prometheus/config/v1/rules/$(printf %s "$ns" | jq -sRr @uri)"
 done
-for ns in $(mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep -E '^e2e/' | sed 's/:$//'); do
+for ns in $(mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep -E '^e2e_' | sed 's/:$//'); do
   mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$L/loki/api/v1/rules/$(printf %s "$ns" | jq -sRr @uri)"
 done
 kubectl patch tenant e2e --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
@@ -7440,7 +7763,7 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ### Added
 - CRDs `observability.antnsn.dev/v1alpha1`: `Tenant` (cluster-scoped), `ContactPoint`, `NotificationPolicy`, `AlertRuleGroup`.
-- Tenant reconciler as single writer: compiles one Alertmanager document per tenant and rule namespaces `<prefix>/<namespace>/<name>` for Mimir and Loki; diffs against the backend; prunes only under the prefix; drift repair on `resyncInterval`.
+- Tenant reconciler as single writer: compiles one Alertmanager document per tenant and rule namespaces `<prefix>/<namespace>/<name>` for Mimir, `<prefix>_<namespace>_<name>` for Loki (its ruler rejects a namespace containing `/`); diffs against the backend; prunes only under the prefix (matched on that backend's separator); drift repair on `resyncInterval`.
 - Receivers: webhook, pushover, slack, discord, telegram, email — secrets via `secretKeyRef` only.
 - Local validation with Alertmanager's config loader and the PromQL parser; errors attributed to the responsible CR.
 - Status conditions `Ready`, `AlertmanagerSynced`, `MimirRulesSynced`, `LokiRulesSynced` (Tenant) and `Accepted`, `Synced` (children); Kubernetes Events on failures.
