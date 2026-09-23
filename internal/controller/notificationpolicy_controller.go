@@ -22,6 +22,7 @@ import (
 	"sort"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -99,6 +100,19 @@ func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alph
 		}
 		if err != nil {
 			return "", "", "", err
+		}
+		// The ContactPoint exists for this tenant but has itself been rejected. Accepting the policy
+		// anyway would have listChildren exclude the ContactPoint and include the policy, so the
+		// Tenant compile fails on a dangling receiver and AlertmanagerSynced goes False/Invalid for
+		// the whole tenant -- the blast radius alerts-operator-8ic removes, one hop removed (Codex
+		// P1 on the first fix). Only an explicit Accepted=False counts: a missing or stale-generation
+		// condition is the window before the ContactPoint's own reconciler has run, which the Tenant
+		// already holds on (children.PendingAM), and flipping every policy False on each ContactPoint
+		// edit would add churn without adding protection. The ContactPoint watch below has no
+		// predicate, so the status change that resolves this re-enqueues the policy.
+		if c := meta.FindStatusCondition(cp.Status.Conditions, v1alpha1.ConditionAccepted); c != nil && c.Status == metav1.ConditionFalse {
+			return metav1.ConditionFalse, v1alpha1.ReasonContactPointNotAccepted,
+				fmt.Sprintf("receiver %q: ContactPoint %s/%s is not accepted (%s: %s)", name, cp.Namespace, cp.Name, c.Reason, c.Message), nil
 		}
 	}
 	// Matchers, durations, group_by and inhibit rules are checked here with Alertmanager's own

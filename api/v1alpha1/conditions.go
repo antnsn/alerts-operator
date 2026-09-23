@@ -20,11 +20,15 @@ const (
 	ReasonBackendNotConfigured = "BackendNotConfigured"
 	ReasonSecretNotFound       = "SecretNotFound"
 	ReasonContactPointNotFound = "ContactPointNotFound"
-	ReasonConflict             = "Conflict"
-	ReasonInvalidRule          = "InvalidRule"
-	ReasonNoNotificationPolicy = "NoNotificationPolicy"
-	ReasonBackendUnavailable   = "BackendUnavailable"
-	ReasonRejected             = "Rejected"
-	ReasonInvalid              = "Invalid"
-	ReasonDeleting             = "Deleting"
+	// ReasonContactPointNotAccepted: a NotificationPolicy routes to a ContactPoint that exists for
+	// the tenant but is itself Accepted=False. Distinct from ContactPointNotFound so the message can
+	// point at the object whose own condition explains the rejection.
+	ReasonContactPointNotAccepted = "ContactPointNotAccepted"
+	ReasonConflict                = "Conflict"
+	ReasonInvalidRule             = "InvalidRule"
+	ReasonNoNotificationPolicy    = "NoNotificationPolicy"
+	ReasonBackendUnavailable      = "BackendUnavailable"
+	ReasonRejected                = "Rejected"
+	ReasonInvalid                 = "Invalid"
+	ReasonDeleting                = "Deleting"
 )
