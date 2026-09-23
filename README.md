@@ -83,4 +83,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 ```bash
 make test          # envtest + unit tests
 make chart-test    # helm lint + render assertions
+make deploy-dev    # install the CI-built :dev image into the current kube-context (docs/e2e.md)
+make undeploy-dev  # remove the dev release (CRDs and CRs stay)
+make purge-dev-crds # delete the CRDs; refuses while any CR exists
 ```

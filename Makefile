@@ -166,6 +166,25 @@ helm-sync-crds: manifests ## Copy generated CRDs into the Helm chart.
 chart-test: helm-sync-crds ## Lint and render the chart with assertions.
 	hack/chart-test.sh
 
+DEV_IMG_TAG ?= dev
+DEV_NS      ?= alerts-operator
+
+.PHONY: deploy-dev
+deploy-dev: helm-sync-crds ## Install the chart against the already-published image at tag $(DEV_IMG_TAG) (built by the dev-image CI job; see docs/e2e.md).
+	helm upgrade --install alerts-operator $(CHART_DIR) -n $(DEV_NS) --create-namespace \
+		--set image.tag=$(DEV_IMG_TAG) --set image.pullPolicy=Always --wait
+
+.PHONY: undeploy-dev
+undeploy-dev: ## Uninstall the dev release. CRDs (and every CR) stay; see purge-dev-crds.
+	helm uninstall alerts-operator -n $(DEV_NS) || true
+
+.PHONY: purge-dev-crds
+purge-dev-crds: ## Delete the CRDs — refuses while any Tenant/ContactPoint/NotificationPolicy/AlertRuleGroup exists.
+	@n=$$(kubectl get tenants,contactpoints,notificationpolicies,alertrulegroups -A --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$n" != "0" ]; then echo "refusing: $$n alerts-operator CRs still exist (delete them first so finalizers clean the backends)"; exit 1; fi
+	kubectl delete crd tenants.observability.antnsn.dev contactpoints.observability.antnsn.dev \
+		notificationpolicies.observability.antnsn.dev alertrulegroups.observability.antnsn.dev --ignore-not-found
+
 ##@ Deployment
 
 ifndef ignore-not-found

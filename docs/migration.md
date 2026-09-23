@@ -56,7 +56,7 @@ clean output in a file instead of eyeballing it in a terminal.
 
 ## 0. Preconditions
 
-- alerts-operator image + chart released (Task 25), or `:dev` image pushed (docs/e2e.md — Task 24, not written as of this task).
+- alerts-operator image + chart released (Task 25), or `:dev` image pushed (see `docs/e2e.md`).
 - ArgoCD health Lua from `docs/argocd-health.md` merged into `argocd-cm`.
 - Confirm the tenant picture *(cluster command)*:
 
