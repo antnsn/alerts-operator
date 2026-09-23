@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
@@ -203,28 +204,50 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 //
 // Terminating Tenants still count: their backend state stays live until their own finalizer removes
 // it, and the CR disappearing is what clears the conflict.
+//
+// This is the rule-namespace form, with no further narrowing: every Tenant on the key genuinely
+// computes the same namespaces as "mine". The Alertmanager document needs one more condition and
+// has its own entry point, conflictingAlertmanagerWriter (tenant_alertmanager.go).
 func (r *TenantReconciler) conflictingTenant(ctx context.Context, tenant *v1alpha1.Tenant, be v1alpha1.Backend, withPrefix bool) (string, error) {
-	if backendAddress(tenant, be) == "" {
-		return "", nil // backend not configured: syncRules/syncAlertmanager aren't called for it
-	}
-	var tenants v1alpha1.TenantList
-	if err := r.List(ctx, &tenants); err != nil {
+	cs, err := claimantsVia(ctx, r.Client, tenant, be, withPrefix)
+	if err != nil {
 		return "", err
 	}
-	// Lowest name wins rather than first-listed, so the reported name is stable across reconciles
-	// when three or more Tenants collide (a name that flapped would rewrite the condition message
-	// and re-enqueue on every pass).
-	conflict := ""
+	return lowestName(cs), nil
+}
+
+// claimantsVia returns the other Tenant CRs that share tenant's ownership key for backend be, read
+// through rd. One lister for every ownership question in the codebase: the steady-state guards pass
+// the cache-backed client, the finalizer passes the uncached API server reader (see claimants in
+// tenant_finalizer.go for why that distinction matters there and not here).
+func claimantsVia(ctx context.Context, rd client.Reader, tenant *v1alpha1.Tenant, be v1alpha1.Backend, withPrefix bool) ([]v1alpha1.Tenant, error) {
+	if backendAddress(tenant, be) == "" {
+		return nil, nil // backend not configured: nothing is synced or finalized for it
+	}
+	var tenants v1alpha1.TenantList
+	if err := rd.List(ctx, &tenants); err != nil {
+		return nil, err
+	}
+	var out []v1alpha1.Tenant
 	for i := range tenants.Items {
-		other := &tenants.Items[i]
-		if !sharesBackendTarget(tenant, other, be, withPrefix) {
-			continue
-		}
-		if conflict == "" || other.Name < conflict {
-			conflict = other.Name
+		if other := &tenants.Items[i]; sharesBackendTarget(tenant, other, be, withPrefix) {
+			out = append(out, *other)
 		}
 	}
-	return conflict, nil
+	return out, nil
+}
+
+// lowestName returns the lowest name among claimants, or "" when there are none. Lowest rather than
+// first-listed so the reported name is stable across reconciles when three or more Tenants collide
+// (a name that flapped would rewrite the condition message and re-enqueue on every pass).
+func lowestName(claimants []v1alpha1.Tenant) string {
+	out := ""
+	for i := range claimants {
+		if out == "" || claimants[i].Name < out {
+			out = claimants[i].Name
+		}
+	}
+	return out
 }
 
 // sharesBackendTarget reports whether other is a different Tenant CR that owns the same backend

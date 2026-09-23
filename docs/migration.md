@@ -21,13 +21,19 @@ only stops the operator from *deleting* a document it can't prove it wrote; it d
 guard the *write* path. Point a Tenant with `tenantId: "1"` at Mimir, get a NotificationPolicy
 Accepted, and whatever was live in tenant `1` before that reconcile is gone.
 
-What the write path *does* guard is the other Tenants this operator manages: if a second Tenant CR
-shares this one's `tenantId` and `spec.mimir.address`, both address the same single document (the
-API is scoped by `X-Scope-OrgID` and the backend URL only, never by `rulesNamespacePrefix`) and
-**neither** writes it. Both report `AlertmanagerSynced=False/Conflict` naming the other and emit an
-`AlertmanagerOwnershipConflict` event; their rule namespaces keep syncing normally. So a `tenantId`
-already claimed by another Tenant CR will *not* be overwritten — but anything outside this
-operator's CRs still will be.
+What the write path *does* guard is the other Tenants this operator manages. All of them address
+one single document per `tenantId` + `spec.mimir.address` (the API is scoped by `X-Scope-OrgID` and
+the backend URL only, never by `rulesNamespacePrefix`), and **the first writer keeps it**: once one
+Tenant has written the document, any other Tenant that tries to write the same one refuses, reports
+`AlertmanagerSynced=False/Conflict` naming the owner and emits an `AlertmanagerOwnershipConflict`
+event. The owner is unaffected and stays `Ready=True`. Rule namespaces keep syncing on both.
+
+A Tenant with no accepted `NotificationPolicy` never writes the document at all, so it is never a
+claimant — several Tenants sharing one org via `rulesNamespacePrefix`, only one of which owns
+notifications, is a supported layout and nothing about it conflicts.
+
+So a `tenantId` already claimed by another Tenant CR will *not* be overwritten — but anything
+outside this operator's CRs still will be.
 
 Verified against this cluster today: tenant `1`'s Alertmanager config is currently empty, but
 tenant `anonymous` holds the real, currently-serving hand-written config (`mal-sync`, Keep +
@@ -381,9 +387,10 @@ promptly rather than leaving it for later.
 
 > **This also degrades other Tenants, not just the stuck one.** A Tenant sitting `Terminating`
 > still counts as a claimant of its backend targets (its state stays live until its own finalizer
-> removes it), so any healthy Tenant sharing its `tenantId` + address keeps reporting
-> `Ready=False/Conflict`: its rule-namespace prune stays disabled, and — since the Alertmanager
-> ownership guard landed — its Alertmanager document stays frozen too. Nothing bounds how long.
+> removes it), so any healthy Tenant sharing its `tenantId` + address **and** its
+> `rulesNamespacePrefix` keeps reporting `Ready=False/Conflict` with its rule-namespace prune
+> disabled. If the wedged Tenant had also written the Alertmanager document, the healthy one cannot
+> write that either — it defers to the stuck owner. Nothing bounds how long.
 > Tracked as `alerts-operator-bqf`, with `alerts-operator-29k` (the survivor is not re-enqueued
 > when the peer finally disappears, so recovery can still take up to one `resyncInterval`). Treat
 > a wedged Tenant as urgent for that reason, not only for its own sake.

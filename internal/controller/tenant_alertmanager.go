@@ -88,29 +88,49 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	}
 
 	// Ownership guard, the steady-state counterpart to the finalizer's (tenant_finalizer.go) and
-	// the exact analogue of syncRules' prune guard -- with the opposite verdict about writing,
-	// because the two targets differ in kind.
+	// the analogue of syncRules' prune guard -- with the opposite verdict about writing, because the
+	// two targets differ in kind.
 	//
-	// For rule namespaces the ruling is "ambiguous ownership never deletes, but still writes":
-	// two Tenants' rule groups occupy different namespaces, so their writes are convergent and
-	// only the prune is destructive. The Alertmanager document has no such separation. There is
-	// exactly one document per (tenantId, address) -- POST /api/v1/alerts replaces it whole -- so
-	// a write here *is* a delete of whatever the other claimant put there. Under the same rule
-	// ("never destroy on an unverified claim") the write must be refused.
+	// For rule namespaces the ruling is "ambiguous ownership never deletes, but still writes": two
+	// Tenants' rule groups occupy different namespaces, so their writes are convergent and only the
+	// prune is destructive. The Alertmanager document has no such separation. There is exactly one
+	// document per (tenantId, address) -- POST /api/v1/alerts replaces it whole -- so a write here
+	// *is* a delete of whatever the other claimant put there. Under the same rule ("never destroy on
+	// an unverified claim") the write must be refused.
 	//
-	// What the two Tenants' owners see: both report AlertmanagerSynced=False/Conflict naming each
-	// other, both emit a Warning event, and Ready goes False/Conflict. The live document freezes
-	// at whatever was last written rather than flipping between the two every resyncInterval.
-	// That is strictly better than the alternative it replaces -- routing silently alternating
-	// every 5 minutes with both Tenants reporting Ready=True, no event, no condition, and real
-	// notifications going to the wrong receivers in between. Frozen and loud beats churning and
-	// silent: the cost is that a *freshly* colliding pair gets no document at all until an
-	// operator gives one of them its own tenantId or address, which the condition says outright.
+	// But only against a peer that has something there to destroy. conflictingAlertmanagerWriter
+	// narrows the claimant set to Tenants that have themselves written the document at this address,
+	// the same narrowing the finalizer has always applied (writingClaimants, below). A Tenant with
+	// spec.mimir set but no accepted NotificationPolicy short-circuits at the ch.Policy == nil branch
+	// above, before any backend I/O, so it is structurally incapable of writing the document and
+	// nothing of its can be destroyed by writing it. Counting such a peer -- which the first version
+	// of this guard did -- froze the document for a "platform Tenant owns notifications, team Tenants
+	// own rules under their own rulesNamespacePrefix" layout, which is exactly the arrangement
+	// rulesNamespacePrefix exists to support, with no remedy that preserves it.
 	//
-	// Rules are untouched by this: syncRules keeps its own per-backend verdict, so two Tenants
-	// with different prefixes go on syncing their rule groups normally while this one condition
-	// reports the shared document they cannot both own.
-	conflict, err := r.conflictingTenant(ctx, tenant, v1alpha1.BackendMimir, false)
+	// So this is first-writer-wins. Does it converge? Yes, and the worst case is bounded:
+	//
+	//   - Steady state, peer appears after this Tenant wrote: the peer sees a writing claimant and
+	//     refuses; this Tenant sees no writing claimant and carries on owning the document at
+	//     Ready=True. Only the newcomer is flagged, which is both correct and the more useful
+	//     signal.
+	//   - Both intend to write, neither has yet: the guard is evaluated before the hash+recency
+	//     skip, and a Tenant that has written keeps its hash forever (nothing clears it), so each
+	//     Tenant writes at most once before it observes a peer's hash. If the cache is current, the
+	//     second one already sees the first's hash and refuses -- one writer, no overwrite. If both
+	//     reconcile inside the cache-lag window they each write once and each record a hash; from
+	//     the next pass on *both* see a writing peer and both refuse permanently. The document is
+	//     whichever landed last and it stops changing.
+	//
+	// Either way it settles after at most one write per Tenant. It does not oscillate: the previous
+	// behaviour's 5-minute alternation was possible only because nothing ever recorded that someone
+	// else had written, and refusing does not clear this Tenant's own hash.
+	//
+	// What the owners see on a real collision: AlertmanagerSynced=False/Conflict naming the peer, an
+	// AlertmanagerOwnershipConflict warning event, Ready=False/Conflict, and children
+	// Synced=False/Conflict. Rules are untouched -- syncRules keeps its own per-backend verdict, so
+	// two Tenants with different prefixes go on syncing their rule groups normally.
+	conflict, err := r.conflictingAlertmanagerWriter(ctx, tenant)
 	if err != nil {
 		// Ownership could not be established at all: same rule as a real collision (never write on
 		// an unverified claim), but Unknown/Pending rather than False, and returned so the caller
@@ -123,9 +143,10 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	}
 	if conflict != "" {
 		msg := fmt.Sprintf(
-			"Tenant %q claims the same Alertmanager document (tenantId %q, address %s); "+
+			"Tenant %q has already written the Alertmanager document for tenantId %q at %s; "+
 				"/api/v1/alerts is scoped by tenantId and address only, never by rulesNamespacePrefix, "+
-				"so exactly one Tenant may write it -- give one of them its own tenantId or address",
+				"so writing it here would replace that Tenant's routing -- give one of them its own "+
+				"tenantId or address, or delete the one that should not own notifications",
 			conflict, tenant.Spec.TenantID, backendAddress(tenant, v1alpha1.BackendMimir))
 		setTenant(metav1.ConditionFalse, v1alpha1.ReasonConflict, msg)
 		if ch.Policy != nil {
@@ -189,6 +210,59 @@ func (r *TenantReconciler) syncAlertmanager(ctx context.Context, tenant *v1alpha
 	setTenant(metav1.ConditionTrue, v1alpha1.ReasonSynced, "")
 	setChildren(nil)
 	return nil
+}
+
+// conflictingAlertmanagerWriter returns the name of another Tenant CR that has itself written the
+// Alertmanager document this Tenant is about to write, or "" when there is none.
+//
+// Two conditions, and both are needed:
+//
+//   - sharesBackendTarget(..., withPrefix=false): the peer addresses the same document. GET/POST/
+//     DELETE /api/v1/alerts is scoped by X-Scope-OrgID and the backend URL alone, so this is
+//     (tenantId, address) with no prefix component -- the key the finalizer has always used for
+//     this target, now the same predicate.
+//   - writingClaimants: the peer has actually written it, at this address. Sharing the key only
+//     means a peer *can read* the document; a Tenant that never writes has nothing there for this
+//     Tenant's write to destroy, so it is not a claimant to defer to. Without this, any Tenant
+//     sharing the org -- including a rules-only one that can never POST -- would disable
+//     Alertmanager for the Tenant that legitimately owns it.
+//
+// Terminating peers still count, as they do for rule namespaces: their document stays live until
+// their own finalizer removes it. That is deliberate and its cost is tracked (alerts-operator-bqf).
+func (r *TenantReconciler) conflictingAlertmanagerWriter(ctx context.Context, tenant *v1alpha1.Tenant) (string, error) {
+	cs, err := claimantsVia(ctx, r.Client, tenant, v1alpha1.BackendMimir, false)
+	if err != nil {
+		return "", err
+	}
+	return lowestName(writingClaimants(cs, backendAddress(tenant, v1alpha1.BackendMimir))), nil
+}
+
+// writingClaimants filters claimants to those that have themselves written an Alertmanager document
+// *at addr* -- the address this Tenant and every claimant in the slice share (claimantsVia with
+// withPrefix=false already filtered on it, so passing it again here is just reusing that same value,
+// not a new comparison basis). Sharing tenantId+address only guarantees a claimant can *read* the
+// document; only a claimant whose own AlertmanagerConfigHash was confirmed *at this address* will
+// ever assert, overwrite or delete it there (Codex P2-2, task-20 review round 1). The address check
+// additionally excludes a claimant whose hash is non-empty but stale from an address it has since
+// been repointed away from -- the same gap fixed for this Tenant's own finalizer gate (Codex P1, fix
+// round 1).
+//
+// Both Alertmanager paths use it, and must: the finalizer, to decide whether it may delete the
+// document (tenant_finalizer.go), and conflictingAlertmanagerWriter above, to decide whether it may
+// write it. Applying it on one side only is how the write path came to refuse writes for peers the
+// delete path was perfectly willing to ignore.
+//
+// Not used for rule-namespace claimants: a rule claimant's ownership is established by sharing the
+// prefix itself, so any such claimant's own prune loop reclaims the residue once it stops seeing
+// this Tenant as a conflict.
+func writingClaimants(claimants []v1alpha1.Tenant, addr string) []v1alpha1.Tenant {
+	var out []v1alpha1.Tenant
+	for _, c := range claimants {
+		if c.Status.AlertmanagerConfigHash != "" && c.Status.AlertmanagerConfigAddress == addr {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // amSyncState records when, at what Tenant generation, and against what backend-auth credentials

@@ -132,42 +132,7 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 // third, already-gone Tenant it had cached as still "live" -- leaving neither to actually clean up
 // (a Codex finding on this task: overlapping, not just simultaneous, deletions can still race).
 func (r *TenantReconciler) claimants(ctx context.Context, tenant *v1alpha1.Tenant, be v1alpha1.Backend, withPrefix bool) ([]v1alpha1.Tenant, error) {
-	addr := backendAddress(tenant, be)
-	if addr == "" {
-		return nil, nil
-	}
-	var tenants v1alpha1.TenantList
-	if err := r.apiReader().List(ctx, &tenants); err != nil {
-		return nil, err
-	}
-	var out []v1alpha1.Tenant
-	for i := range tenants.Items {
-		if other := &tenants.Items[i]; sharesBackendTarget(tenant, other, be, withPrefix) {
-			out = append(out, *other)
-		}
-	}
-	return out, nil
-}
-
-// writingClaimants filters claimants to those that have themselves written an Alertmanager document
-// *at addr* -- the address this Tenant and every claimant in the slice share (claimants(...,
-// withPrefix=false) already filtered on it, so passing it again here is just reusing that same
-// value, not a new comparison basis). Sharing tenantId+address only guarantees a claimant can *read*
-// the document; only a claimant whose own AlertmanagerConfigHash was confirmed *at this address* will
-// ever assert, overwrite, or delete it there, so only those are valid Tenants to defer Alertmanager
-// cleanup to (Codex P2-2, task-20 review round 1). The address check additionally excludes a claimant
-// whose hash is non-empty but stale from an address it has since been repointed away from -- the same
-// gap fixed for this Tenant's own gate (Codex P1, fix round 1). Not used for rule-namespace claimants:
-// a rule claimant's ownership is established by sharing the prefix itself, so any such claimant's own
-// prune loop reclaims the residue once it stops seeing this Tenant as a conflict.
-func writingClaimants(claimants []v1alpha1.Tenant, addr string) []v1alpha1.Tenant {
-	var out []v1alpha1.Tenant
-	for _, c := range claimants {
-		if c.Status.AlertmanagerConfigHash != "" && c.Status.AlertmanagerConfigAddress == addr {
-			out = append(out, c)
-		}
-	}
-	return out
+	return claimantsVia(ctx, r.apiReader(), tenant, be, withPrefix)
 }
 
 // finalizeOwner decides, among tenant and its claimants for one backend target, which single Tenant
