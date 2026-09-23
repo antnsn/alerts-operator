@@ -40,6 +40,12 @@ Long-form project memory: `~/Documents/obsidian/Private/projects/Alerts Operator
 - Every backend call needs `X-Scope-OrgID` (home cluster tenant `1`).
 - Rule namespaces contain `/` — URL-escape path segments.
 - Never `DELETE /api/v1/alerts` outside the Tenant finalizer.
+- Makefile recipes rely on `.SHELLFLAGS = -ec` + `bash -o pipefail`. Stock macOS `/usr/bin/make` is GNU Make
+  3.81 and silently ignores `.SHELLFLAGS`, so a recipe that "works" there may abort, or skip a safety abort,
+  under Linux/CI/gmake ≥ 4.
+- Verify any Makefile-recipe change under gmake ≥ 4.0 (`brew install make`, check `make --version`) or
+  reproduce the recipe under `bash -eo pipefail -c` and say so in the report. A macOS-stock-make run is not
+  evidence.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:5c2c0639 -->
