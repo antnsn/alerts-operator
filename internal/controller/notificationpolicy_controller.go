@@ -31,12 +31,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
 )
 
 const maxRouteDepth = 10
 
-// NotificationPolicyReconciler validates the route tree, receiver references and per-tenant uniqueness.
+// NotificationPolicyReconciler validates the route tree (shape, matchers, durations, inhibit
+// rules), receiver references and per-tenant uniqueness.
 type NotificationPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -98,6 +100,13 @@ func (r *NotificationPolicyReconciler) validate(ctx context.Context, pol *v1alph
 		if err != nil {
 			return "", "", "", err
 		}
+	}
+	// Matchers, durations, group_by and inhibit rules are checked here with Alertmanager's own
+	// loader, so a policy the Tenant compile would reject is refused on this object at Accepted time
+	// -- the same gate ContactPoint and AlertRuleGroup have (alerts-operator-8ic). Receiver names
+	// were resolved above; the validator only substitutes placeholders for them.
+	if verr := compile.ValidateNotificationPolicy(pol); verr != nil {
+		return metav1.ConditionFalse, v1alpha1.ReasonInvalid, verr.Error(), nil
 	}
 	var all v1alpha1.NotificationPolicyList
 	if err := r.List(ctx, &all, client.MatchingFields{index.IndexTenantRef: pol.Spec.TenantRef}); err != nil {

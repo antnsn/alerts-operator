@@ -62,3 +62,11 @@ data:
 
 YAML anchors are resolved by the apiserver's YAML parser, so the three child kinds share one Lua body.
 Verify: `argocd app get <app>` shows `Degraded` for a CR with `Accepted=False`.
+
+`Accepted` is the verdict that matters for a broken child. Every child kind is validated on its own
+at Accepted time -- an `AlertRuleGroup`'s PromQL, a `ContactPoint`'s receiver (with its real Secret
+values, redacted in the message), a `NotificationPolicy`'s matchers, durations and inhibit rules --
+and an `Accepted=False` child is left out of the Tenant's compile. So a malformed `ContactPoint`
+shows `Degraded` on that one object while the `Tenant` and its other children stay `Healthy`; a
+`Tenant` going `Degraded` with `AlertmanagerSynced=False/Invalid` is not the expected shape of a
+single bad object anymore.

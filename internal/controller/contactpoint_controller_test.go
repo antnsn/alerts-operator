@@ -48,3 +48,28 @@ func TestContactPointAccepted(t *testing.T) {
 	}
 	waitCondition(t, po, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
 }
+
+// TestContactPointRejectsMalformedReceiverAtAccepted (alerts-operator-8ic): a receiver Alertmanager
+// would refuse must be Accepted=False on the ContactPoint itself, so listChildren excludes it and
+// the Tenant's document keeps compiling for everyone else -- the same shape AlertRuleGroup already
+// has for a bad PromQL expression. Fixing the spec flips it back to Accepted=True.
+func TestContactPointRejectsMalformedReceiverAtAccepted(t *testing.T) {
+	newFakeTenant(t, "cp-invalid-tenant", true, false)
+
+	bad := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "cp-bad-url", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: "cp-invalid-tenant", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "not-a-url"}}}}
+	createAndCleanup(t, bad)
+	waitCondition(t, bad, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalid)
+	if c := findCond(bad, observabilityv1alpha1.ConditionAccepted); c.Message == "" {
+		t.Fatalf("Accepted=False/Invalid must carry the receiver error, got %+v", c)
+	}
+
+	if err := testClient.Get(testCtx, clientKey(bad), bad); err != nil {
+		t.Fatal(err)
+	}
+	bad.Spec.Webhook[0].URL = "http://hook"
+	if err := testClient.Update(testCtx, bad); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, bad, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+}

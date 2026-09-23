@@ -1,6 +1,7 @@
 package compile
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"sigs.k8s.io/yaml"
 
+	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
 
@@ -68,6 +70,83 @@ func ValidateAlertmanager(cfg *backend.AlertmanagerConfig) error {
 		}
 	}
 	return nil
+}
+
+// ValidateContactPoint compiles one ContactPoint into its receiver and validates that receiver in
+// isolation, exactly as Alertmanager() does for each ContactPoint of a tenant. The ContactPoint
+// reconciler runs it at Accepted time so a malformed receiver is refused on the object that carries
+// it, instead of surfacing only when the Tenant compiles the whole document and taking every other
+// receiver and the routing tree down with it (alerts-operator-8ic) -- the same shape as
+// AlertRuleGroup, which parses PromQL at Accepted time.
+//
+// It validates with the *real* Secret values, not placeholders: a webhook URL, Slack URL or Discord
+// URL may come entirely from a Secret, and whether it is valid is a property of that value.
+// Validating a placeholder would accept what the Tenant compile then rejects, which is the very
+// asymmetry this exists to remove. The values pass through the same secretRecorder as the compile
+// path, so the returned error is redacted and safe to record in a status condition. An unresolvable
+// Secret is returned as an error naming the ref (not validated as empty); the reconciler checks
+// Secret existence first and reports that case as SecretNotFound before calling this.
+func ValidateContactPoint(cp *v1alpha1.ContactPoint, secrets SecretResolver) error {
+	rec := newSecretRecorder(secrets)
+	_, err := compileAndValidateReceiver(cp, rec)
+	if err != nil {
+		return errors.New(rec.redact(err.Error()))
+	}
+	return nil
+}
+
+// ValidateNotificationPolicy runs Alertmanager's config loader over one policy's route tree and
+// inhibit rules in isolation, with a placeholder webhook receiver standing in for every receiver
+// name the tree references. This catches what the whole-document ValidateAlertmanager would
+// otherwise attribute to the policy only at Tenant compile time -- unparsable matchers, bad
+// durations, malformed group_by, broken inhibit rules -- so the NotificationPolicy reconciler can
+// refuse them at Accepted time, the same gate ContactPoint and AlertRuleGroup have
+// (alerts-operator-8ic). Receiver existence is not this function's concern (the reconciler checks
+// ContactPoint references itself), and templates belong to the Tenant, so neither is validated here.
+func ValidateNotificationPolicy(pol *v1alpha1.NotificationPolicy) error {
+	names, err := pol.Spec.Route.Receivers()
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	doc := amConfig{}
+	for _, name := range names {
+		full := ReceiverName(pol.Namespace, name)
+		if known[full] {
+			continue
+		}
+		known[full] = true
+		doc.Receivers = append(doc.Receivers, amReceiver{Name: full, WebhookConfigs: []amWebhook{{URL: "http://placeholder.invalid/"}}})
+	}
+	route, err := compileRoute(&pol.Spec.Route, pol.Namespace, known)
+	if err != nil {
+		return err
+	}
+	doc.Route = route
+	for _, ir := range pol.Spec.InhibitRules {
+		doc.InhibitRules = append(doc.InhibitRules, amInhibitRule{SourceMatchers: ir.SourceMatchers, TargetMatchers: ir.TargetMatchers, Equal: ir.Equal})
+	}
+	raw, err := yaml.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	if _, err := amconfig.Load(string(raw)); err != nil {
+		return fmt.Errorf("alertmanager config: %w", err)
+	}
+	return nil
+}
+
+// compileAndValidateReceiver is the single receiver-level pipeline shared by ValidateContactPoint
+// and Alertmanager(): resolve secrets, build the receiver, validate it in isolation.
+func compileAndValidateReceiver(cp *v1alpha1.ContactPoint, rec *secretRecorder) (amReceiver, error) {
+	rcv, err := compileReceiver(cp, rec.resolve)
+	if err != nil {
+		return rcv, err
+	}
+	if err := validateReceiver(rcv); err != nil {
+		return rcv, err
+	}
+	return rcv, nil
 }
 
 // validateReceiver runs Alertmanager's config loader against a single receiver in isolation

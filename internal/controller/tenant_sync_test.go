@@ -762,3 +762,33 @@ func TestSyncRulesDoesNotRewriteCanonicalisedDurations(t *testing.T) {
 		t.Fatalf("nothing should be pruned: %v", s.Requests())
 	}
 }
+
+// TestTenantAlertmanagerSurvivesMalformedContactPoint is the acceptance test for
+// alerts-operator-8ic: one ContactPoint with a receiver Alertmanager would refuse must not stop the
+// tenant's document from being compiled and written for everyone else. The bad object ends at
+// Accepted=False/Invalid and is excluded; the document reaches the backend with only the valid
+// receiver.
+func TestTenantAlertmanagerSurvivesMalformedContactPoint(t *testing.T) {
+	tn, srv := newFakeTenant(t, "tn-bad-cp", true, false)
+	good := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "good-hook", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://good"}}}}
+	bad := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "bad-hook", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "not-a-url"}}}}
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "bad-cp-pol", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "good-hook"}}}
+	for _, o := range []observabilityv1alpha1.Conditioned{good, bad, pol} {
+		createAndCleanup(t, o)
+	}
+
+	waitCondition(t, bad, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalid)
+	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	waitCondition(t, good, observabilityv1alpha1.ConditionSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+
+	am := srv.Alertmanager("1")
+	if am == nil || !strings.Contains(am.Config, "- name: default/good-hook") {
+		t.Fatalf("document must be written with the valid receiver: %+v", am)
+	}
+	if strings.Contains(am.Config, "default/bad-hook") {
+		t.Fatalf("the rejected ContactPoint must not reach the document: %s", am.Config)
+	}
+}

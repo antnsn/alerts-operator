@@ -31,10 +31,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
+	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
 )
 
-// ContactPointReconciler validates ContactPoints (tenant + secret refs) and sets Accepted.
+// ContactPointReconciler validates ContactPoints (tenant + secret refs + the receiver itself) and
+// sets Accepted.
 type ContactPointReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -60,12 +62,19 @@ func (r *ContactPointReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	} else if err != nil {
 		return ctrl.Result{}, err
 	} else {
-		missing, err := missingSecretRef(ctx, r.Client, cp.Namespace, cp.SecretRefs())
+		missing, secrets, err := missingSecretRef(ctx, r.Client, cp.Namespace, cp.SecretRefs())
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if missing != "" {
 			status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonSecretNotFound, missing
+		} else if verr := compile.ValidateContactPoint(&cp, secrets); verr != nil {
+			// Same gate AlertRuleGroup applies to PromQL: a receiver Alertmanager would refuse is
+			// rejected here, on this object, so listChildren excludes it and the Tenant's document
+			// still compiles for every other ContactPoint (alerts-operator-8ic). Validated with the
+			// real Secret values (see compile.ValidateContactPoint for why), redacted before they
+			// reach the condition. The Secret watch re-runs this when a referenced value changes.
+			status, reason, msg = metav1.ConditionFalse, v1alpha1.ReasonInvalid, verr.Error()
 		}
 	}
 
@@ -78,8 +87,11 @@ func (r *ContactPointReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, err
 }
 
-// missingSecretRef returns a message for the first unresolvable ref, "" if all resolve.
-func missingSecretRef(ctx context.Context, c client.Client, namespace string, refs []v1alpha1.SecretKeyRef) (string, error) {
+// missingSecretRef returns a message for the first unresolvable ref, "" if all resolve, plus a
+// SecretResolver over the Secrets it fetched so the receiver validation that follows reads each
+// Secret once, live (the client is uncached for Secrets, see cache.go), and sees exactly the values
+// the existence check saw.
+func missingSecretRef(ctx context.Context, c client.Client, namespace string, refs []v1alpha1.SecretKeyRef) (string, compile.SecretResolver, error) {
 	cache := map[string]*corev1.Secret{}
 	for _, ref := range refs {
 		sec, ok := cache[ref.Name]
@@ -89,18 +101,29 @@ func missingSecretRef(ctx context.Context, c client.Client, namespace string, re
 			if errors.IsNotFound(err) {
 				sec = nil
 			} else if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			cache[ref.Name] = sec
 		}
 		if sec == nil {
-			return fmt.Sprintf("secret %s/%s not found", namespace, ref.Name), nil
+			return fmt.Sprintf("secret %s/%s not found", namespace, ref.Name), nil, nil
 		}
 		if _, ok := sec.Data[ref.Key]; !ok {
-			return fmt.Sprintf("secret %s/%s key %s not found", namespace, ref.Name, ref.Key), nil
+			return fmt.Sprintf("secret %s/%s key %s not found", namespace, ref.Name, ref.Key), nil, nil
 		}
 	}
-	return "", nil
+	resolver := func(ns, name, key string) (string, error) {
+		sec := cache[name]
+		if ns != namespace || sec == nil {
+			return "", fmt.Errorf("not found")
+		}
+		v, ok := sec.Data[key]
+		if !ok {
+			return "", fmt.Errorf("key not found")
+		}
+		return string(v), nil
+	}
+	return "", resolver, nil
 }
 
 func (r *ContactPointReconciler) secretToContactPoints(ctx context.Context, o client.Object) []reconcile.Request {

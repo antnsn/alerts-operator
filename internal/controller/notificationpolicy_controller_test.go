@@ -139,3 +139,30 @@ func TestNotificationPolicyInvalidRouteJSON(t *testing.T) {
 	createAndCleanup(t, pol)
 	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalid)
 }
+
+// TestNotificationPolicyRejectsBadDurationAtAccepted (alerts-operator-8ic, policy half): a duration or
+// matcher Alertmanager's loader would refuse is Accepted=False/Invalid on the policy itself, before
+// the Tenant ever compiles the document. Fixing it flips Accepted back to True.
+func TestNotificationPolicyRejectsBadDurationAtAccepted(t *testing.T) {
+	newFakeTenant(t, "np-invalid-tenant", true, false)
+	cp := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "np-inv-cp", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: "np-invalid-tenant", Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://x"}}}}
+	createAndCleanup(t, cp)
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np-inv-pol", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: "np-invalid-tenant",
+			Route: observabilityv1alpha1.Route{Receiver: "np-inv-cp", GroupWait: "not-a-duration"}}}
+	createAndCleanup(t, pol)
+	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionFalse, observabilityv1alpha1.ReasonInvalid)
+	if c := findCond(pol, observabilityv1alpha1.ConditionAccepted); !strings.Contains(c.Message, "not-a-duration") {
+		t.Fatalf("Accepted=False/Invalid must name the bad value, got %+v", c)
+	}
+
+	if err := testClient.Get(testCtx, clientKey(pol), pol); err != nil {
+		t.Fatal(err)
+	}
+	pol.Spec.Route.GroupWait = "30s"
+	if err := testClient.Update(testCtx, pol); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, pol, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+}

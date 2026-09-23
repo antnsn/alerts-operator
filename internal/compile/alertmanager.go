@@ -224,11 +224,8 @@ func Alertmanager(in AlertmanagerInput) (*backend.AlertmanagerConfig, error) {
 	byName := map[string]bool{}
 	for i := range in.ContactPoints {
 		cp := &in.ContactPoints[i]
-		rcv, err := compileReceiver(cp, rec.resolve)
+		rcv, err := compileAndValidateReceiver(cp, rec)
 		if err != nil {
-			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
-		}
-		if err := validateReceiver(rcv); err != nil {
 			return nil, rec.attribute("ContactPoint", cp.Namespace, cp.Name, err)
 		}
 		cfg.Receivers = append(cfg.Receivers, rcv)
