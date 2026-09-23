@@ -712,3 +712,53 @@ func TestTenantOwnershipConflictIsPerBackend(t *testing.T) {
 		t.Fatalf("LokiRulesSynced must be unaffected by a Mimir collision, got %+v", c)
 	}
 }
+
+// TestSyncRulesDoesNotRewriteCanonicalisedDurations is the controller-level form of the rewrite
+// loop: a group written with legal but non-canonical durations comes back from the ruler in
+// canonical form, and a byte-exact comparison then re-POSTs it on every single reconcile forever
+// while reporting Synced=True. Only the fake canonicalising durations the way rulefmt does makes
+// this visible in `go test` at all -- before that, a round-trip through the fake was the identity
+// function and this test could not have failed no matter how wrong the comparison was.
+func TestSyncRulesDoesNotRewriteCanonicalisedDurations(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+
+	tn := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "tn-durations"},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1"}}
+	mimirG := &observabilityv1alpha1.AlertRuleGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "dur", Namespace: "default", Generation: 1},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir,
+			Groups: []observabilityv1alpha1.RuleGroup{{Name: "g", Interval: "60s", Rules: []observabilityv1alpha1.Rule{
+				// Every spelling a ruler rewrites: seconds that fold into minutes, minutes that fold
+				// into hours, and a zero duration that rulefmt's omitempty drops entirely.
+				{Alert: "A", Expr: "up == 0", For: "300s", KeepFiringFor: "0s"},
+				{Alert: "B", Expr: "up == 1", For: "90m"},
+			}}}},
+		Status: observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+	}
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, mimirG), Recorder: record.NewFakeRecorder(20)}
+	mc := mimir.New(backend.Options{Address: s.URL, TenantID: "1"})
+	groups := []observabilityv1alpha1.AlertRuleGroup{*mimirG}
+
+	if _, err := r.syncRules(context.Background(), tn, mc, observabilityv1alpha1.BackendMimir, groups, map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := countPrefix(s.Requests(), "POST "); n != 1 {
+		t.Fatalf("first sync should write the group exactly once, got %d: %v", n, s.Requests())
+	}
+
+	for pass := range 3 {
+		s.ResetRequests()
+		if _, err := r.syncRules(context.Background(), tn, mc, observabilityv1alpha1.BackendMimir, groups, map[string]bool{}); err != nil {
+			t.Fatal(err)
+		}
+		if n := countPrefix(s.Requests(), "POST "); n != 0 {
+			t.Fatalf("pass %d re-wrote an unchanged group: the backend's canonical durations must compare equal to the desired ones, got %v",
+				pass+2, s.Requests())
+		}
+	}
+	if n := countPrefix(s.Requests(), "DELETE "); n != 0 {
+		t.Fatalf("nothing should be pruned: %v", s.Requests())
+	}
+}

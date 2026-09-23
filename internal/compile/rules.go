@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/prometheus/common/model"
+
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
 )
@@ -103,10 +105,13 @@ func RulesEqual(a, b []backend.RuleGroup) bool {
 	return reflect.DeepEqual(normalize(a), normalize(b))
 }
 
-// normalize returns a deep copy sorted by group name with empty maps nil-ed; inputs are never mutated.
+// normalize returns a deep copy sorted by group name, with empty maps nil-ed and every duration
+// reduced to its canonical spelling; inputs are never mutated (the caller's `want` side is the
+// desired state the diff loop goes on to POST, and must keep the user's own spelling).
 func normalize(in []backend.RuleGroup) []backend.RuleGroup {
 	out := make([]backend.RuleGroup, len(in))
 	for i, g := range in {
+		g.Interval = normalizeDuration(g.Interval)
 		g.Rules = make([]backend.Rule, len(in[i].Rules))
 		for j, r := range in[i].Rules {
 			if len(r.Labels) == 0 {
@@ -115,12 +120,43 @@ func normalize(in []backend.RuleGroup) []backend.RuleGroup {
 			if len(r.Annotations) == 0 {
 				r.Annotations = nil
 			}
+			r.For = normalizeDuration(r.For)
+			r.KeepFiringFor = normalizeDuration(r.KeepFiringFor)
 			g.Rules[j] = r
 		}
 		out[i] = g
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// normalizeDuration reduces a Prometheus duration to the single spelling a ruler will hand back,
+// so a comparison against backend state is about the value and not about how it was typed.
+//
+// Mimir and Loki both decode a posted rule group through Prometheus' rulefmt, where
+// interval/for/keep_firing_for are model.Duration with `omitempty`. Storing and re-serialising
+// therefore rewrites them: "300s" comes back as "5m", "60s" as "1m", "90m" as "1h30m", and a zero
+// duration is dropped from the document altogether. All of those are legal input --
+// model.ParseDuration accepts them, so validateRuleGroups accepts them -- so a byte-exact
+// comparison would see a difference on every single reconcile, POST the group again, and report
+// Synced=True while doing it forever. The only outward symptom is ruler write rate.
+//
+// A string ParseDuration rejects is returned unchanged rather than dropped: it cannot have come
+// from a backend (which would have rejected the write), the child's own validation rejects it
+// before it ever reaches here, and comparing it verbatim is the behaviour that cannot hide a
+// difference.
+func normalizeDuration(s string) string {
+	if s == "" {
+		return ""
+	}
+	d, err := model.ParseDuration(s)
+	if err != nil {
+		return s
+	}
+	if d == 0 {
+		return "" // rulefmt's omitempty: a zero duration is absent from the backend's document
+	}
+	return d.String()
 }
 
 func copyMap(m map[string]string) map[string]string {

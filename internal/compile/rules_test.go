@@ -191,3 +191,48 @@ func TestRulesEqualIgnoresOrder(t *testing.T) {
 		t.Fatal("RulesEqual mutated its input")
 	}
 }
+
+// TestRulesEqualIgnoresDurationSpelling covers the rewrite loop a byte-exact comparison causes.
+// Mimir's and Loki's rulers both re-serialise a stored rule group through Prometheus' rulefmt,
+// whose interval/for/keep_firing_for are model.Duration with `omitempty`: what comes back is the
+// canonical spelling, not the one that was posted. A user may legally write `for: 300s`
+// (model.ParseDuration accepts it, so validateRuleGroups passes), and the ruler will hand back
+// `5m` forever after -- so comparing raw strings means every reconcile sees a difference, POSTs
+// again and reports Synced=True while looping, with ruler write rate the only symptom.
+func TestRulesEqualIgnoresDurationSpelling(t *testing.T) {
+	group := func(interval, forD, keep string) []backend.RuleGroup {
+		return []backend.RuleGroup{{Name: "g", Interval: interval, Rules: []backend.Rule{
+			{Alert: "A", Expr: "up == 0", For: forD, KeepFiringFor: keep},
+		}}}
+	}
+	for _, tc := range []struct {
+		name    string
+		a, b    []backend.RuleGroup
+		wantEqu bool
+	}{
+		{"seconds vs minutes", group("60s", "300s", ""), group("1m", "5m", ""), true},
+		{"minutes vs compound", group("", "90m", ""), group("", "1h30m", ""), true},
+		{"zero is the same as absent", group("", "0s", "0"), group("", "", ""), true},
+		{"keep_firing_for too", group("", "", "120s"), group("", "", "2m"), true},
+		{"genuinely different durations still differ", group("", "5m", ""), group("", "6m", ""), false},
+		{"an unparseable duration is compared verbatim", group("", "not-a-duration", ""), group("", "5m", ""), false},
+		{"two identical unparseable durations still match", group("", "not-a-duration", ""), group("", "not-a-duration", ""), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RulesEqual(tc.a, tc.b); got != tc.wantEqu {
+				t.Fatalf("RulesEqual(%+v, %+v) = %v, want %v", tc.a, tc.b, got, tc.wantEqu)
+			}
+		})
+	}
+}
+
+// TestRulesEqualDoesNotMutateItsInputs guards the property normalize already documents: the
+// duration rewriting above must happen on the copy, not on the caller's desired state (which the
+// diff loop goes on to POST).
+func TestRulesEqualDoesNotMutateItsInputs(t *testing.T) {
+	in := []backend.RuleGroup{{Name: "g", Interval: "60s", Rules: []backend.Rule{{Alert: "A", Expr: "up", For: "300s"}}}}
+	RulesEqual(in, in)
+	if in[0].Interval != "60s" || in[0].Rules[0].For != "300s" {
+		t.Fatalf("inputs were rewritten in place: %+v", in)
+	}
+}

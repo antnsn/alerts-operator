@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/prometheus/common/model"
 	"sigs.k8s.io/yaml"
 
 	"github.com/antnsn/alerts-operator/internal/backend"
@@ -125,14 +126,63 @@ func (s *Server) Alertmanager(tenant string) *backend.AlertmanagerConfig {
 func (s *Server) SetRules(tenant, ns string, groups []backend.RuleGroup) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tenant(tenant).mimir[ns] = append([]backend.RuleGroup(nil), groups...)
+	s.tenant(tenant).mimir[ns] = canonicalizeGroups(groups)
 }
 
 // SetLokiRules seeds the Loki ruler state for tenant/namespace.
 func (s *Server) SetLokiRules(tenant, ns string, groups []backend.RuleGroup) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tenant(tenant).loki[ns] = append([]backend.RuleGroup(nil), groups...)
+	s.tenant(tenant).loki[ns] = canonicalizeGroups(groups)
+}
+
+// canonicalizeGroups applies canonicalizeGroup to a whole namespace's worth of groups, so seeded
+// state is the same shape a real ruler would be holding rather than whatever the test typed.
+func canonicalizeGroups(groups []backend.RuleGroup) []backend.RuleGroup {
+	out := make([]backend.RuleGroup, len(groups))
+	for i, g := range groups {
+		out[i] = canonicalizeGroup(g)
+	}
+	return out
+}
+
+// canonicalizeGroup rewrites a rule group the way a real ruler does when it stores one.
+//
+// Mimir and Loki both decode a posted group through Prometheus' rulefmt, whose interval/for/
+// keep_firing_for fields are model.Duration with `omitempty`. So what comes back out of a GET is
+// not the bytes that went in: every duration has been re-emitted by model.Duration.String()
+// ("300s" -> "5m", "60s" -> "1m", "90m" -> "1h30m") and a zero one has been dropped entirely
+// ("0s" -> absent). Storing the decoded struct verbatim -- which this fake used to do -- makes a
+// round-trip the identity function and hides every comparison bug of that shape: the operator
+// would re-POST an unchanged group forever while reporting Synced=True, and no test could see it.
+// This is the same failure shape as the Loki namespace misdiagnosis, where a fake that agreed with
+// the code's assumption kept a wrong assumption alive for twenty tasks.
+//
+// An unparseable duration is left as-is rather than rejected: a real ruler would 400, but the
+// operator never sends one (validateRuleGroups parses every duration at Accepted time), so
+// modelling the rejection here would only add a path nothing exercises.
+func canonicalizeGroup(g backend.RuleGroup) backend.RuleGroup {
+	out := copyRuleGroup(g)
+	out.Interval = canonicalDuration(out.Interval)
+	for i := range out.Rules {
+		out.Rules[i].For = canonicalDuration(out.Rules[i].For)
+		out.Rules[i].KeepFiringFor = canonicalDuration(out.Rules[i].KeepFiringFor)
+	}
+	return out
+}
+
+func canonicalDuration(s string) string {
+	if s == "" {
+		return ""
+	}
+	d, err := model.ParseDuration(s)
+	if err != nil {
+		return s
+	}
+	if d == 0 {
+		return "" // model.Duration is `omitempty` in rulefmt: a zero duration is not serialised
+	}
+	return d.String()
 }
 
 // SetAlertmanager seeds the Alertmanager config for tenant.
@@ -310,15 +360,16 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[s
 			return
 		}
 		ns := seg[0]
+		stored := canonicalizeGroup(g)
 		replaced := false
 		for i := range rules[ns] {
-			if rules[ns][i].Name == g.Name {
-				rules[ns][i] = g
+			if rules[ns][i].Name == stored.Name {
+				rules[ns][i] = stored
 				replaced = true
 			}
 		}
 		if !replaced {
-			rules[ns] = append(rules[ns], g)
+			rules[ns] = append(rules[ns], stored)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	case r.Method == http.MethodDelete && len(seg) == 1:

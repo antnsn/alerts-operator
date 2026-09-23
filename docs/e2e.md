@@ -475,3 +475,50 @@ Not covered, and only a real cluster can settle it:
 The original defect was invisible to twenty tasks' worth of unit tests precisely because the fake
 accepted what real Loki rejects. The new tests close that specific gap; they do not make a live run
 unnecessary.
+
+## 9. Backend canonicalisation of rule-group fields — PENDING LIVE VERIFICATION
+
+**Status: not verified against a live cluster** (same power outage as §8). The duration half is
+fixed and covered by tests; the rest of this section is a list of assumptions about what a real
+ruler hands back, none of which any test in this repo can settle.
+
+### What changed
+
+`compile.RulesEqual` compared `interval`, `for` and `keep_firing_for` as raw strings, and
+`backend/fake` stored the exact `backend.RuleGroup` it decoded from the POST body, so a round-trip
+through the fake was the identity function. A real ruler decodes through Prometheus' `rulefmt`,
+where those three fields are `model.Duration` with `omitempty`, and re-emits them canonically:
+`300s` → `5m`, `60s` → `1m`, `90m` → `1h30m`, `0s` → absent. All of those are legal input, so a
+user writing `for: 300s` would have had the operator re-POST that group on every reconcile forever
+while reporting `Synced=True`, with ruler write rate the only symptom.
+
+Both halves are fixed: `RulesEqual` now compares durations through `model.ParseDuration`, and
+`backend/fake` canonicalises them on write and on seeding, so this class of bug fails in
+`go test` (`TestSyncRulesDoesNotRewriteCanonicalisedDurations`) rather than living in production.
+
+### What must be proven once the cluster is back
+
+Fold into the §8 run, same `e2e` namespace/tenant/prefix. Two extra steps:
+
+1. Apply a Mimir `AlertRuleGroup` with deliberately non-canonical durations — `interval: 60s`,
+   one rule with `for: 300s`, one with `for: 90m`, one with `keepFiringFor: 0s`.
+2. `mcurl -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules/e2e%2Fe2e%2F<name>` and record
+   **exactly** what comes back for each field. Then wait out two `resyncInterval`s and count
+   POSTs to that namespace in the operator log (or via `alerts_operator_sync_total`): it must be
+   **zero** after the first write.
+3. Repeat both against Loki with a LogQL group.
+
+### Other fields a backend might canonicalise, and what the comparison would do
+
+Durations were the obvious case. These are the ones looked for while fixing it, none confirmed:
+
+| Field | Risk | Status |
+|---|---|---|
+| `interval` when the operator sends none | If a ruler *defaults* it (e.g. returns `interval: 1m` for a group posted without one) the comparison sees `""` vs `"1m"` and rewrites forever. Same shape as the duration bug, not fixable blind — `""` cannot be normalised to a default this code does not know. | **Unverified — check in step 2 above.** A group posted with no `interval` must come back with no `interval`. |
+| Rule order within a group | `normalize` sorts *groups* by name but never reorders rules, deliberately: rule order is semantically meaningful to `rulefmt`. A ruler that reordered them would rewrite forever. | Unverified. Prometheus preserves order; assumed, not observed. |
+| `expr` | `rulefmt` stores the expression as a string and does not re-print the parsed AST, so whitespace and formatting should survive verbatim. If any ruler ever normalised PromQL/LogQL text, every group would rewrite forever. | Unverified. |
+| Loki `limit`, `align_evaluation_time_on_interval`; Mimir `source_tenants`, `query_offset`/`evaluation_delay` | Not fields of `backend.RuleGroup`, so the YAML decode drops them. No rewrite loop — but the operator also cannot see drift in them, and would silently discard one if a user's group were ever adopted from outside. | Known and accepted for v1. |
+| `labels` / `annotations` | Decoded into Go maps, compared with `reflect.DeepEqual`, so serialisation order is irrelevant. An empty map and an absent one are both nil-ed by `normalize`. | Covered by tests. |
+
+The point of §8 applies here unchanged: a fake that agrees with the code's assumption proves
+nothing about the assumption.
