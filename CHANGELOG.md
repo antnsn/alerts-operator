@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/).
 
+## [0.1.1] - 2026-09-23
+
+### Fixed
+- `ContactPoint` receivers are validated when the object is accepted, with the real Secret values, not first when the Tenant compiles its whole Alertmanager document. A malformed receiver (for example a webhook URL that does not parse) is now `Accepted=False` with reason `Invalid`; Secret values are redacted from the message.
+- `NotificationPolicy` matchers, durations, `group_by` and inhibit rules are validated when the object is accepted. A policy that routes to a `ContactPoint` which is itself `Accepted=False` is `Accepted=False` with the new reason `ContactPointNotAccepted`, and is re-evaluated when that `ContactPoint` changes.
+- Consequence: one malformed `ContactPoint` or `NotificationPolicy` no longer stops the whole tenant's Alertmanager sync. The Tenant compiles only accepted children, so the blast radius is the offending object, as it already was for `AlertRuleGroup`.
+
 ## [0.1.0] - 2026-09-23
 
 ### Added
@@ -16,4 +23,5 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 ### Not included
 - Tempo (no ruler), mute timings, cross-namespace references, admission webhooks.
 
+[0.1.1]: https://github.com/antnsn/alerts-operator/releases/tag/v0.1.1
 [0.1.0]: https://github.com/antnsn/alerts-operator/releases/tag/v0.1.0
