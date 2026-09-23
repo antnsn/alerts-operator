@@ -6,7 +6,8 @@
 > `test/e2e/` suite this project does not have (only `internal/controller/suite_test.go`, an
 > envtest suite, exists). Kind cannot exercise this project's actual integration surface — real
 > Mimir, real Loki, real Alertmanager, real Infisical-backed secrets — which is exactly what this
-> task exists to validate. See "Facts established" / blast-radius scoping in the Task 24 report
+> task exists to validate. See the "Production tenants ... before/after proof" and "Deliberate
+> deviations from the brief" sections of `.superpowers/sdd/2026-09-21-alerts-operator/task-24-report.md`
 > for how this was kept safe.
 
 Run executed 2026-09-22 against commit `2ff8497`, image `ghcr.io/antnsn/alerts-operator:sha-2ff8497`.
@@ -14,6 +15,10 @@ Run executed 2026-09-22 against commit `2ff8497`, image `ghcr.io/antnsn/alerts-o
 > **§4's Loki assertions are stale and were never re-run.** They were observed against the broken
 > `/`-joined Loki namespace scheme. The fix for that (`alerts-operator-b4o`, commit `67b2239`) has
 > landed but has **not** been verified on a live cluster — see §8 for what still has to be proven.
+
+> **Tenant stuck `Terminating` mid-teardown?** Skip to "§7 Teardown → If the Tenant delete doesn't
+> complete" for the manual-cleanup fallback. This is the one procedure in this doc you're likely to
+> need out of order, not front-to-back.
 
 No kind. The acceptance run is against the real Mimir (`mimir-distributed-nginx.mimir:80`) and
 Loki (`loki-gateway.loki`), but under its own backend tenant `e2e` (Mimir/Loki multitenancy keeps
@@ -329,7 +334,34 @@ to the bulk-`GET` reconcile reads, which do succeed.
   policy verified in §3) before deleting anything, so the tenant's last-known state matches what §3
   validated.
 - `kubectl delete tenant e2e` → object gone within 10s (single `kubectl delete` call, no fallback
-  manual cleanup needed).
+  manual cleanup needed this run — but see the fallback procedure immediately below, kept in this
+  doc for the run where it *is* needed).
+
+### If the Tenant delete doesn't complete (fallback — not exercised this run)
+
+`kubectl delete tenant e2e` normally finishes in seconds: the finalizer deletes the Alertmanager
+config and every `e2e/*`/`e2e_*` rule namespace in both backends, then removes itself. If a backend
+is unreachable at delete time, the finalizer can't confirm cleanup and the Tenant stays
+`Terminating` indefinitely (the operator's retry-forever policy — this is expected behavior, not a
+bug; see `alerts-operator-l57`/`docs/migration.md` Appendix B for the analogous missing-Secret
+case). If you need to clean up by hand in that situation:
+
+```bash
+mcurl -X DELETE -H 'X-Scope-OrgID: e2e' $M/api/v1/alerts
+for ns in $(mcurl -H 'X-Scope-OrgID: e2e' $M/prometheus/config/v1/rules | grep -E '^e2e/' | sed 's/:$//'); do
+  mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$M/prometheus/config/v1/rules/$(printf %s "$ns" | jq -sRr @uri)"
+done
+for ns in $(mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep -E '^e2e_' | sed 's/:$//'); do
+  mcurl -X DELETE -H 'X-Scope-OrgID: e2e' "$L/loki/api/v1/rules/$(printf %s "$ns" | jq -sRr @uri)"
+done
+kubectl patch tenant e2e --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+```
+
+(Mimir rule namespaces are still prefixed `e2e/` — grep `^e2e/`; Loki rule namespaces are now
+`e2e_` — grep `^e2e_`, per the §8 separator fix. If you're running this against a pre-`67b2239`
+build, use `^e2e/` for both.) This is a manual override of the finalizer's own safety check —
+only use it once you've confirmed the backend really is unreachable, not as a first resort.
+
 - Verify: `$L/loki/api/v1/rules` and `$M/api/v1/alerts` for `X-Scope-OrgID: e2e` → `404` as
   expected. `$M/prometheus/config/v1/rules` → **`200` with body `{}`**, not `404` — this matches
   the Mimir quirk already documented in `docs/migration.md` §"Prove alerting end to end" (a tenant

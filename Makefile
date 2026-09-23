@@ -180,7 +180,13 @@ undeploy-dev: ## Uninstall the dev release. CRDs (and every CR) stay; see purge-
 
 .PHONY: purge-dev-crds
 purge-dev-crds: ## Delete the CRDs — refuses while any Tenant/ContactPoint/NotificationPolicy/AlertRuleGroup exists.
-	@n=$$(kubectl get tenants,contactpoints,notificationpolicies,alertrulegroups -A --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	@n=0; \
+	for crd in tenants.observability.antnsn.dev contactpoints.observability.antnsn.dev notificationpolicies.observability.antnsn.dev alertrulegroups.observability.antnsn.dev; do \
+		if kubectl get crd "$$crd" >/dev/null 2>&1; then \
+			c=$$(kubectl get "$$crd" -A --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+			n=$$((n + c)); \
+		fi; \
+	done; \
 	if [ "$$n" != "0" ]; then echo "refusing: $$n alerts-operator CRs still exist (delete them first so finalizers clean the backends)"; exit 1; fi
 	kubectl delete crd tenants.observability.antnsn.dev contactpoints.observability.antnsn.dev \
 		notificationpolicies.observability.antnsn.dev alertrulegroups.observability.antnsn.dev --ignore-not-found
