@@ -12,6 +12,8 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 )
 
 // byObjectFor finds the ByObject entry for T. cache.Options.ByObject is keyed by a client.Object
@@ -200,5 +202,61 @@ func TestCacheOptionsCacheHoldsNoSecretDataAgainstARealAPIServer(t *testing.T) {
 	}
 	if string(live.Data["password"]) != "hunter2" {
 		t.Fatalf("precondition: the API server must still hold the value the operator reads live, got %+v", live.Data)
+	}
+}
+
+// TestSecretDataOnlyChangeStillReachesTheBackend is the property the payload-stripping transform
+// could plausibly have broken, and the one thing about it that nothing else in the suite pins.
+//
+// A credential rotation changes a Secret's data and nothing else. After the transform, the object
+// the informer stores is identical before and after except for its resourceVersion -- none of the
+// fields any watch handler here reads has changed -- so "the cache sees no difference, therefore
+// nothing is enqueued" is a plausible-sounding failure that would silently strand every rotated
+// credential until the next resync. (It is not what happens: controller-runtime does no content
+// comparison and no predicate is registered on any of these watches. This test is what makes that
+// stay true.)
+//
+// Asserted end to end rather than at the informer, because the informer firing is not the property
+// anyone cares about: the rotated value reaching Mimir is. The Tenant's resyncInterval is the 5m
+// default here, so nothing but the Secret watch can deliver it inside the poll window.
+//
+// The evidence previously cited for this -- TestContactPointAccepted's watch-driven Accepted flip --
+// is a Secret *creation*, which is a different informer event and does not cover a data-only update.
+func TestSecretDataOnlyChangeStillReachesTheBackend(t *testing.T) {
+	tn, srv := newFakeTenant(t, "rot-tenant", true, false)
+
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "rot-po", Namespace: "default"},
+		Data: map[string][]byte{"user": []byte("U1"), "token": []byte("T1")}}
+	cp := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "rot-po", Namespace: "default"},
+		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Pushover: []observabilityv1alpha1.PushoverConfig{{
+			UserKeySecretRef: observabilityv1alpha1.SecretKeyRef{Name: "rot-po", Key: "user"},
+			TokenSecretRef:   observabilityv1alpha1.SecretKeyRef{Name: "rot-po", Key: "token"}}}}}
+	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "rot-pol", Namespace: "default"},
+		Spec: observabilityv1alpha1.NotificationPolicySpec{TenantRef: tn.Name, Route: observabilityv1alpha1.Route{Receiver: "rot-po"}}}
+	createAndCleanup(t, sec)
+	createAndCleanup(t, cp)
+	createAndCleanup(t, pol)
+
+	waitCondition(t, tn, observabilityv1alpha1.ConditionAlertmanagerSynced, metav1.ConditionTrue, observabilityv1alpha1.ReasonSynced)
+	if am := srv.Alertmanager("1"); am == nil || !strings.Contains(am.Config, "user_key: U1") {
+		t.Fatalf("precondition: the original credential must be live in the backend, got %+v", am)
+	}
+
+	// Data only: no label, annotation or any other field is touched.
+	srv.ResetRequests()
+	if err := testClient.Get(testCtx, clientKey(sec), sec); err != nil {
+		t.Fatal(err)
+	}
+	sec.Data["user"] = []byte("U2-rotated")
+	if err := testClient.Update(testCtx, sec); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		am := srv.Alertmanager("1")
+		return am != nil && strings.Contains(am.Config, "user_key: U2-rotated")
+	})
+	if n := countPrefix(srv.Requests(), "POST /api/v1/alerts"); n == 0 {
+		t.Fatalf("the rotated credential reached the backend without a POST: %v", srv.Requests())
 	}
 }
