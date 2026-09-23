@@ -144,7 +144,22 @@ spec:
                   in the stored object: "self == oldSelf" is a transition rule and is not evaluated against a
                   field that was absent on the old object, so an unset-then-set edit would otherwise bypass
                   immutability entirely -- the field must actually be present from creation for oldSelf to exist.
-                pattern: ^[A-Za-z0-9_.-]+$
+
+                  "_" is excluded from the pattern on purpose. A Loki rule namespace is joined with "_"
+                  (compile.BackendNamespace -- Loki's ruler 404s on any namespace containing "/"), and a
+                  Kubernetes namespace or object name can never contain "_", so "_" is an unambiguous separator
+                  only as long as the prefix has none either. Allowing one would make <prefix>_<ns>_<name>
+                  ambiguous and would break the segment-boundary ownership match the prune and the finalizer
+                  gate their deletes on -- concretely, a Tenant with prefix "team" would own everything starting
+                  "team_", which includes every namespace of a Tenant with prefix "team_a", and would prune them
+                  (conflictingTenant compares prefixes for equality, so it would not see the two as colliding).
+                  With "_" forbidden here that is unreachable: no legal prefix can start with another legal
+                  prefix followed by "_". See compile.OwnsNamespace and TestLokiOwnershipRequiresUnderscoreFreePrefix.
+
+                  This is a tightening of the pattern, not a migration: the field is immutable, and nothing had
+                  ever been deployed when it changed (v0.1.0 was not yet tagged and the task-24 e2e run ended
+                  with `make purge-dev-crds`), so no stored Tenant can carry an "_" prefix.
+                pattern: ^[A-Za-z0-9.-]+$
                 type: string
                 x-kubernetes-validations:
                 - message: rulesNamespacePrefix is immutable

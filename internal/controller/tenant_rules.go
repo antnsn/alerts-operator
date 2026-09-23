@@ -30,8 +30,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 		condType = v1alpha1.ConditionLokiRulesSynced
 		target = metrics.TargetLokiRules
 	}
-	prefix := tenant.Prefix() + "/"
-	desired := compile.Rules(tenant.Prefix(), groups)
+	desired := compile.Rules(be, tenant.Prefix(), groups)
 	// Computed once, up front: this is "how many groups the accepted AlertRuleGroups call for," not
 	// a backend-confirmed count -- the diff loop below reports the same desired total even when some
 	// per-namespace writes fail, so a List failure must report it too rather than 0. Zeroing it out
@@ -106,7 +105,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	// *current* prefix. spec.tenantId and spec.rulesNamespacePrefix are both CEL-immutable
 	// (api/v1alpha1/tenant_types.go) precisely so that "current org + current prefix" is also the
 	// only combination this Tenant has ever used: were either field mutable, namespaces under the
-	// OLD one would fall outside both `desired` and this HasPrefix check and so would never be
+	// OLD one would fall outside both `desired` and this ownership check and so would never be
 	// pruned, silently orphaning them (duplicate, un-pruned rules/alerts indefinitely) -- and
 	// blindly reclaiming an old prefix on a rename would risk deleting rules that now belong to a
 	// different tenant/purpose, which this reconciler has no way to distinguish from a rename.
@@ -114,7 +113,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 	// Immutability pins what THIS Tenant owned in the past; conflictingTenant covers the other half
 	// -- whether some OTHER Tenant CR owns the same namespaces right now. Only the namespace prune
 	// needs that guard: a namespace in `desired` is derived from one of our own children
-	// (<prefix>/<child namespace>/<child name>), and a child has exactly one tenantRef, so no other
+	// (<prefix><sep><child namespace><sep><name>), and a child has exactly one tenantRef, so no other
 	// Tenant can desire it and the per-group deletes in the diff loop above are never ambiguous.
 	conflict, conflictErr := r.conflictingTenant(ctx, tenant, be)
 	var pruneErrs []error
@@ -138,7 +137,11 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 				kept = true
 				continue
 			}
-			if _, wanted := desired[ns]; strings.HasPrefix(ns, prefix) && !wanted {
+			// compile.OwnsNamespace, never a bare strings.HasPrefix on the unslashed prefix: the
+			// match has to land on a segment boundary with *this backend's* separator ("/" for
+			// Mimir, "_" for Loki), or "alerts-operator" would also claim -- and delete --
+			// "alerts-operator-other/default/x" / "alerts-operator-other_default_x".
+			if _, wanted := desired[ns]; compile.OwnsNamespace(be, tenant.Prefix(), ns) && !wanted {
 				if err := store.DeleteNamespace(ctx, ns); err != nil {
 					pruneErrs = append(pruneErrs, err)
 				}
@@ -148,7 +151,7 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 
 	var all []error
 	for i := range groups {
-		ns := compile.BackendNamespace(tenant.Prefix(), groups[i].Namespace, groups[i].Name)
+		ns := compile.BackendNamespace(be, tenant.Prefix(), groups[i].Namespace, groups[i].Name)
 		r.setChildSynced(ctx, &groups[i], nsErr[ns])
 		if nsErr[ns] != nil {
 			all = append(all, nsErr[ns])
@@ -192,7 +195,8 @@ func (r *TenantReconciler) syncRules(ctx context.Context, tenant *v1alpha1.Tenan
 // Ownership is a three-part key -- (tenantId, backend address, effective prefix) -- because that is
 // exactly what decides both what store.List returns and what the prune loop reads as "mine":
 // X-Scope-OrgID comes from spec.tenantId, the endpoint from spec.{mimir,loki}.address, and the
-// <prefix>/<k8s namespace>/<name> namespace scheme from Prefix(). Nothing in the Mimir or Loki rule
+// <prefix><sep><k8s namespace><sep><name> namespace scheme from Prefix() (sep is "/" on Mimir and
+// "_" on Loki -- see compile.BackendNamespace). Nothing in the Mimir or Loki rule
 // API carries the owning Tenant, and the namespace scheme is fixed by the design, so two Tenants on
 // the same key are genuinely indistinguishable in the backend -- the collision can only be caught
 // here, at reconcile time, by looking at the CRs.

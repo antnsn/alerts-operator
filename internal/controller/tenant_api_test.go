@@ -145,6 +145,56 @@ func TestTenantRulesNamespacePrefixImmutable(t *testing.T) {
 	})
 }
 
+// TestTenantRulesNamespacePrefixExcludesUnderscore: a Loki rule namespace is
+// <prefix>_<k8s-namespace>_<name> (compile.BackendNamespace -- Loki's ruler 404s on any namespace
+// containing "/"). A Kubernetes namespace or object name can never contain "_", so "_" is an
+// unambiguous separator only while the prefix contains none either; a prefix like "team_a" would
+// make the namespace ambiguous and break the segment-boundary ownership match the prune and the
+// finalizer gate their deletes on. The CRD pattern therefore excludes it.
+//
+// The field is CEL-immutable and nothing has been deployed, so there is no migration concern.
+func TestTenantRulesNamespacePrefixExcludesUnderscore(t *testing.T) {
+	srv := fake.New()
+	defer srv.Close()
+	for _, c := range []struct {
+		name    string
+		prefix  string
+		wantErr bool
+	}{
+		{"underscore rejected", "team_a", true},
+		{"leading underscore rejected", "_team", true},
+		{"dot and dash still allowed", "team-a.b", false},
+		{"default still allowed", observabilityv1alpha1.DefaultRulesNamespacePrefix, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			obj := &observabilityv1alpha1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-prefix-us-" + strings.ReplaceAll(strings.ReplaceAll(c.prefix, "_", "u"), ".", "d")},
+				Spec: observabilityv1alpha1.TenantSpec{
+					TenantID: "1", Mimir: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: c.prefix,
+				},
+			}
+			err := testClient.Create(testCtx, obj)
+			if c.wantErr {
+				if err == nil {
+					_ = testClient.Delete(testCtx, obj)
+					t.Fatalf("rulesNamespacePrefix %q must be rejected: it would make a Loki rule namespace ambiguous", c.prefix)
+				}
+				if !strings.Contains(err.Error(), "spec.rulesNamespacePrefix") {
+					t.Fatalf("rejection should name the field, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rulesNamespacePrefix %q must still be accepted: %v", c.prefix, err)
+			}
+			_ = testClient.Delete(testCtx, obj)
+			waitFor(t, func() bool {
+				return errors.IsNotFound(testClient.Get(testCtx, client.ObjectKeyFromObject(obj), &observabilityv1alpha1.Tenant{}))
+			})
+		})
+	}
+}
+
 // TestTenantIDImmutable covers P2-1 of the Task 19 review: spec.tenantId has the identical
 // orphaning property as rulesNamespacePrefix, and was still mutable. It is sent as X-Scope-OrgID on
 // every backend call, so editing it from "1" to "2" makes the next reconcile list org 2 (empty),

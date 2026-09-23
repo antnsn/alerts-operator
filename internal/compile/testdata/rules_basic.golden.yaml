@@ -1,9 +1,3 @@
-alerts-operator/loki/udm:
-- name: udm
-  rules:
-  - alert: UDMErrors
-    expr: sum(rate({host="udm"} |= "error" [5m])) > 1
-    keep_firing_for: 10m
 alerts-operator/monitoring/homelab:
 - interval: 1m
   name: node.health
@@ -17,3 +11,9 @@ alerts-operator/monitoring/homelab:
       severity: critical
   - expr: avg by (job) (up)
     record: job:up:ratio
+alerts-operator_loki_udm:
+- name: udm
+  rules:
+  - alert: UDMErrors
+    expr: sum(rate({host="udm"} |= "error" [5m])) > 1
+    keep_firing_for: 10m

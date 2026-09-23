@@ -18,7 +18,6 @@ import (
 
 	observabilityv1alpha1 "github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
-	"github.com/antnsn/alerts-operator/internal/compile"
 	"github.com/antnsn/alerts-operator/internal/index"
 )
 
@@ -210,8 +209,16 @@ func TestTenantListChildrenStaleGeneration(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "missing-arg", Namespace: "default", Generation: 1},
 			Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendMimir, Groups: ruleGroups("up == 0")},
 		}
+		// A stale *Loki* group: its keep entry must be keyed with Loki's separator, not Mimir's, or
+		// the Loki prune would never see the entry and would delete a namespace whose new content
+		// simply hasn't been validated yet.
+		staleLokiARG := &observabilityv1alpha1.AlertRuleGroup{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale-loki-arg", Namespace: "default", Generation: 2},
+			Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendLoki, Groups: ruleGroups(`{job="x"} |= "e"`)},
+			Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(1)},
+		}
 
-		r := &TenantReconciler{Client: newChildrenFakeClient(t, currentARG, staleARG, missingARG)}
+		r := &TenantReconciler{Client: newChildrenFakeClient(t, currentARG, staleARG, missingARG, staleLokiARG)}
 		ch, err := r.listChildren(context.Background(), tn)
 		if err != nil {
 			t.Fatal(err)
@@ -219,9 +226,27 @@ func TestTenantListChildrenStaleGeneration(t *testing.T) {
 		if len(ch.MimirGroups) != 1 || ch.MimirGroups[0].Name != "current-arg" {
 			t.Fatalf("accepted-current AlertRuleGroup should be the only one included: %+v", ch.MimirGroups)
 		}
+		// Both backends' spellings for every stale child, spelled out literally rather than
+		// round-tripped through the helper under test (a key built by the same call the production
+		// code makes would agree with it even if both used the wrong separator).
+		//
+		// Both spellings, not just spec.backend's: spec.backend is itself part of the spec, so an
+		// edit switching a group from mimir to loki reads as the new backend while Accepted still
+		// describes the old one. Keeping only the new one would leave the namespace the group still
+		// occupies unprotected from the old backend's prune -- see
+		// TestTenantKeepsBothBackendNamespacesWhileBackendSwitchIsStale.
 		wantKeep := map[string]bool{
-			compile.BackendNamespace(tn.Prefix(), "default", "stale-arg"):   true,
-			compile.BackendNamespace(tn.Prefix(), "default", "missing-arg"): true,
+			"alerts-operator/default/stale-arg":      true,
+			"alerts-operator_default_stale-arg":      true,
+			"alerts-operator/default/missing-arg":    true,
+			"alerts-operator_default_missing-arg":    true,
+			"alerts-operator/default/stale-loki-arg": true,
+			"alerts-operator_default_stale-loki-arg": true,
+		}
+		for k := range wantKeep {
+			if strings.Contains(k, "_") && strings.Contains(k, "/") {
+				t.Fatalf("a Loki keep key must not contain %q: %q", "/", k)
+			}
 		}
 		if !reflect.DeepEqual(ch.KeepNamespaces, wantKeep) {
 			t.Fatalf("KeepNamespaces = %+v, want %+v (stale/missing AlertRuleGroups must be kept, not pruned)", ch.KeepNamespaces, wantKeep)

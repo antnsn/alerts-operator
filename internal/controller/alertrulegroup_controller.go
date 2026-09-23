@@ -64,7 +64,7 @@ func (r *AlertRuleGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	case err != nil:
 		return ctrl.Result{}, err
 	default:
-		backendNS = compile.BackendNamespace(tenant.Prefix(), arg.Namespace, arg.Name)
+		backendNS = compile.BackendNamespace(arg.Spec.Backend, tenant.Prefix(), arg.Namespace, arg.Name)
 		switch {
 		case arg.Spec.Backend == v1alpha1.BackendMimir && tenant.Spec.Mimir == nil,
 			arg.Spec.Backend == v1alpha1.BackendLoki && tenant.Spec.Loki == nil:

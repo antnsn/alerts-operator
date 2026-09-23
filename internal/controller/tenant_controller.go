@@ -291,7 +291,24 @@ func (r *TenantReconciler) listChildren(ctx context.Context, tenant *v1alpha1.Te
 				ch.LokiGroups = append(ch.LokiGroups, a)
 			}
 		case staleGeneration(&a):
-			ch.KeepNamespaces[compile.BackendNamespace(tenant.Prefix(), a.Namespace, a.Name)] = true
+			// Every backend's spelling of this child's namespace, not just spec.backend's.
+			//
+			// spec.backend is part of the spec, so an edit that switches an AlertRuleGroup from
+			// mimir to loki (or back) bumps Generation and makes spec.backend read as the NEW
+			// backend while Accepted still describes the old one. Keeping only the new backend's
+			// namespace would protect the one the group is moving *to* and leave the one it
+			// currently occupies unprotected: the old backend's prune would see a namespace under
+			// its prefix that nothing desires and delete live, firing rules before the edit has
+			// even been validated (Codex P1, alerts-operator-b4o review round 1).
+			//
+			// Before the per-backend separator both spellings were the same string, so one entry
+			// covered both; this restores that property explicitly. The extra entry is free: keep
+			// only ever suppresses a prune, a name identifies exactly one child object in its
+			// namespace, and the entry for a backend the child does not use matches nothing in that
+			// backend's state -- so it cannot even set syncRules' `kept` flag spuriously.
+			for _, be := range []v1alpha1.Backend{v1alpha1.BackendMimir, v1alpha1.BackendLoki} {
+				ch.KeepNamespaces[compile.BackendNamespace(be, tenant.Prefix(), a.Namespace, a.Name)] = true
+			}
 		}
 	}
 	return ch, nil

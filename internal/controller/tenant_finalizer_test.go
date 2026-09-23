@@ -23,6 +23,11 @@ import (
 func TestTenantFinalizerCleansBackend(t *testing.T) {
 	tn, srv := newFakeTenant(t, "fin-tenant", true, true)
 	srv.SetRules("1", "other/x", []backend.RuleGroup{{Name: "keep", Rules: []backend.Rule{{Alert: "K", Expr: "up"}}}})
+	// A Loki namespace under a *lookalike* prefix: same leading characters, but the next character
+	// is not the separator. deleteOwnedNamespaces matches on prefix+separator, so this is a
+	// different owner's state and must survive. Reverting that to a bare HasPrefix on the unslashed
+	// prefix deletes it.
+	srv.SetLokiRules("1", "alerts-operator-other_default_x", []backend.RuleGroup{{Name: "keep", Rules: []backend.Rule{{Alert: "KO", Expr: `{a="b"}`}}}})
 	keep := &observabilityv1alpha1.ContactPoint{ObjectMeta: metav1.ObjectMeta{Name: "fin-keep", Namespace: "default"},
 		Spec: observabilityv1alpha1.ContactPointSpec{TenantRef: tn.Name, Webhook: []observabilityv1alpha1.WebhookConfig{{URL: "http://keep"}}}}
 	pol := &observabilityv1alpha1.NotificationPolicy{ObjectMeta: metav1.ObjectMeta{Name: "fin-pol", Namespace: "default"},
@@ -33,8 +38,8 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 		createAndCleanup(t, o)
 	}
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
-	if srv.Alertmanager("1") == nil || len(srv.LokiRules("1")["alerts-operator/default/fin-g"]) != 1 {
-		t.Fatal("precondition: backend populated")
+	if srv.Alertmanager("1") == nil || len(srv.LokiRules("1")["alerts-operator_default_fin-g"]) != 1 {
+		t.Fatalf("precondition: backend populated, got %+v", srv.LokiRules("1"))
 	}
 
 	// Backend down: deletion is blocked, finalizer stays, Ready=False/Deleting.
@@ -57,11 +62,14 @@ func TestTenantFinalizerCleansBackend(t *testing.T) {
 	if srv.Alertmanager("1") != nil {
 		t.Fatal("alertmanager config not deleted")
 	}
-	if _, ok := srv.LokiRules("1")["alerts-operator/default/fin-g"]; ok {
+	if _, ok := srv.LokiRules("1")["alerts-operator_default_fin-g"]; ok {
 		t.Fatal("owned loki namespace not deleted")
 	}
 	if _, ok := srv.Rules("1")["other/x"]; !ok {
 		t.Fatal("foreign mimir namespace deleted")
+	}
+	if _, ok := srv.LokiRules("1")["alerts-operator-other_default_x"]; !ok {
+		t.Fatal("a loki namespace under a lookalike prefix was deleted: ownership must match on a segment boundary")
 	}
 }
 
@@ -321,7 +329,8 @@ func TestTenantFinalizerSkipsLokiRuleNamespacesSharedWithLiveClaimant(t *testing
 	srv := fake.New()
 	defer srv.Close()
 	const collidePrefix = "fin-lrule-collide"
-	const survivorNS = collidePrefix + "/default/keep-l"
+	// "_"-joined: Loki's ruler rejects a namespace containing "/" (alerts-operator-b4o).
+	const survivorNS = collidePrefix + "_default_keep-l"
 
 	survivor := &observabilityv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "fin-lrule-survivor"},
 		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1", Loki: &observabilityv1alpha1.BackendSpec{Address: srv.URL}, RulesNamespacePrefix: collidePrefix}}

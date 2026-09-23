@@ -223,7 +223,8 @@ func (s *Server) handleAM(w http.ResponseWriter, r *http.Request, st *tenantStat
 	}
 }
 
-// segments splits "/ns/group" (escaped) into decoded parts.
+// segments splits "/ns/group" (escaped) into decoded parts, the way Mimir's ruler routes: on the
+// raw, still-escaped path, so an escaped "/" inside one segment stays inside it.
 func segments(rest string) []string {
 	rest = strings.Trim(rest, "/")
 	if rest == "" {
@@ -238,12 +239,40 @@ func segments(rest string) []string {
 	return parts
 }
 
+// decodedSegments splits on the DECODED path, the way Loki's ruler routes: %2F is turned back into
+// a literal "/" before pattern matching, so it counts as a path-segment boundary. This is what
+// makes a namespace with an embedded slash unaddressable on Loki (alerts-operator-b4o).
+func decodedSegments(rest string) []string {
+	if u, err := unescape(rest); err == nil {
+		rest = u
+	}
+	rest = strings.Trim(rest, "/")
+	if rest == "" {
+		return nil
+	}
+	return strings.Split(rest, "/")
+}
+
 func unescape(s string) (string, error) {
 	return url.PathUnescape(s)
 }
 
 func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[string][]backend.RuleGroup, rest string, loki bool) {
 	seg := segments(rest)
+	if loki {
+		// Loki routes on the decoded path (see decodedSegments): a namespace containing "/" yields
+		// more segments than any registered pattern has, so no route matches and the ruler answers a
+		// bare 404 -- for POST, DELETE and GET alike. Verified against live Loki 3.6.7:
+		// POST /loki/api/v1/rules/flatns -> 202, POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm -> 404.
+		// A namespace with exactly one embedded slash decodes to two segments and so collides with
+		// the {namespace}/{group} route instead, which is why POST there answers 405: that fallthrough
+		// is reproduced by simply routing on the decoded segments below.
+		seg = decodedSegments(rest)
+		if len(seg) > 2 {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	switch {
 	case r.Method == http.MethodGet && len(seg) == 0:
 		if len(rules) == 0 {
@@ -262,12 +291,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request, rules map[s
 		b, _ := yaml.Marshal(map[string][]backend.RuleGroup{seg[0]: gs})
 		_, _ = w.Write(b)
 	case r.Method == http.MethodGet && len(seg) == 2:
-		if loki {
-			// Mirrors Loki 3.6.7: per-group GET is broken and returns a malformed 404.
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte("<html>not found</html>"))
-			return
-		}
+		// Loki's per-group GET is not special-cased: on a slash-free namespace it works exactly like
+		// Mimir's (verified GET=200 on live Loki 3.6.7). The operator still only ever uses the bulk
+		// GET -- see internal/backend/loki -- but for sufficiency, not because this route is broken.
 		for _, g := range rules[seg[0]] {
 			if g.Name == seg[1] {
 				b, _ := yaml.Marshal(g)

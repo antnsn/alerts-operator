@@ -31,7 +31,12 @@ Long-form project memory: `~/Documents/obsidian/Private/projects/Alerts Operator
 
 ## Gotchas
 
-- Loki 3.6.7 ruler: per-group `GET /loki/api/v1/rules/{ns}/{group}` returns malformed 404. Use bulk `GET /loki/api/v1/rules` only.
+- Loki's ruler router matches on the **decoded** path, so a rule namespace containing `/` (even as `%2F`) is
+  unaddressable: every per-namespace route 404s. Loki rule namespaces are therefore `<prefix>_<k8s-ns>_<name>`
+  (`_`; k8s names can't contain it). Mimir keeps `/` and is unaffected. `rulesNamespacePrefix` forbids `_`.
+- Per-group `GET /loki/api/v1/rules/{ns}/{group}` **works** on Loki 3.6.7 (verified 200). The old
+  "malformed 404" claim was a misdiagnosis of the slash problem. The operator still reads only the bulk
+  `GET /loki/api/v1/rules` — sufficient for the diff and already proven — but not because per-group is broken.
 - Every backend call needs `X-Scope-OrgID` (home cluster tenant `1`).
 - Rule namespaces contain `/` — URL-escape path segments.
 - Never `DELETE /api/v1/alerts` outside the Tenant finalizer.

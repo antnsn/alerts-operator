@@ -58,7 +58,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 | `Tenant` | cluster | Backend addresses, `tenantId` (`X-Scope-OrgID`), optional auth, template ConfigMap, rule-namespace prefix, resync interval. Single writer to Mimir/Loki. |
 | `ContactPoint` | namespaced | Alertmanager receiver(s): webhook, pushover, slack, discord, telegram, email. Secrets only via `secretKeyRef` in the same namespace. Becomes receiver `<namespace>/<name>`. |
 | `NotificationPolicy` | namespaced | Alertmanager route tree + inhibit rules. One per Tenant (oldest wins). `receiver` names are ContactPoints in the same namespace. |
-| `AlertRuleGroup` | namespaced | PrometheusRule-shaped groups for `backend: mimir` or `backend: loki`. Lands in backend namespace `<prefix>/<namespace>/<name>`. |
+| `AlertRuleGroup` | namespaced | PrometheusRule-shaped groups for `backend: mimir` or `backend: loki`. Lands in backend namespace `<prefix>/<namespace>/<name>` (Mimir) or `<prefix>_<namespace>_<name>` (Loki — its ruler rejects a namespace containing `/`). |
 
 ## Status conditions
 
@@ -72,7 +72,7 @@ kubectl get tenants; kubectl get contactpoints,notificationpolicies,alertrulegro
 
 ## Guarantees and limits
 
-- Prunes only backend rule namespaces under `<prefix>/`. Everything else in the tenant is left alone.
+- Prunes only backend rule namespaces under `<prefix>/` (Mimir) / `<prefix>_` (Loki), matched on that segment boundary. Everything else in the tenant is left alone.
 - Deleting a `Tenant` deletes its Alertmanager config and all rule namespaces under its prefix (finalizer) — but only what it can prove it wrote (`status.alertmanagerConfigHash`/`status.alertmanagerConfigAddress` matching the current address). Writing is not guarded the same way: the first accepted NotificationPolicy overwrites whatever Alertmanager config is already live for that tenant, hand-written or not. See [`docs/migration.md`](docs/migration.md#before-you-begin) before pointing a Tenant at a tenant ID that already has alerting configured.
 - `spec.tenantId` and `spec.rulesNamespacePrefix` are immutable; backend addresses are not. Moving a backend address orphans everything the operator wrote at the old one — see [`docs/migration.md`](docs/migration.md#appendix-a-repointing-a-tenants-mimir-or-loki-address-later).
 - No Tempo support: alert on Tempo metrics-generator series via Mimir rules.

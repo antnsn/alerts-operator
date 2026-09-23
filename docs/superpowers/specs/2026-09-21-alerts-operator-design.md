@@ -137,10 +137,20 @@ spec:
           expr: avg by (job) (up)
 status:
   conditions: [Accepted, Synced]
-  backendNamespace: alerts-operator/monitoring/homelab
+  backendNamespace: alerts-operator/monitoring/homelab   # mimir; loki would be alerts-operator_monitoring_homelab
 ```
 
-Backend rule namespace = `<prefix>/<k8s-namespace>/<name>`. Group names unique
+Backend rule namespace = `<prefix>/<k8s-namespace>/<name>` for `backend: mimir`, and
+`<prefix>_<k8s-namespace>_<name>` for `backend: loki`. The separator differs because Loki's ruler
+HTTP router matches on the *decoded* path: `%2F` becomes a path-segment boundary, so any namespace
+containing a literal `/` produces more segments than any registered pattern has and every
+per-namespace route (POST, DELETE, per-group GET) 404s. Verified against live Loki 3.6.7:
+`POST /loki/api/v1/rules/flatns` → 202, `POST /loki/api/v1/rules/e2e%2Fe2e%2Fudm` → 404. Mimir's
+ruler routes on the raw escaped path and is unaffected, so its scheme is unchanged. `_` is the
+separator for Loki because a Kubernetes namespace or object name can contain `-` and `.` freely but
+never `_`; `spec.rulesNamespacePrefix` is pattern-restricted to exclude `_` for the same reason, so
+`<prefix>_<ns>_<name>` is unambiguous and ownership can be matched on a true segment boundary.
+Group names unique
 within one CR (`listType=map` on `groups`). `expr` is a string: PrometheusRule's bare-number
 form (`expr: 1`, IntOrString) must be quoted (`expr: "1"`); otherwise groups paste in unchanged. `backend: loki` requires `tenant.spec.loki`; `mimir` requires
 `tenant.spec.mimir` (checked at reconcile).
@@ -175,9 +185,12 @@ validate and set `Accepted`, then enqueue their Tenant. Children have no finaliz
    - sha256 of compiled document. If hash == `status.alertmanagerConfigHash` and
      resync not due → skip. Else `GET /api/v1/alerts`, compare; if different `POST`.
 4. **Rules** per backend present (`mimir`, `loki`):
-   - `compile.Rules(groups)` → map `backendNamespace → []RuleGroup`.
-   - `List()` all namespaces/groups for tenant (bulk endpoint only; Loki 3.6.7
-     per-group GET returns malformed 404).
+   - `compile.Rules(backend, groups)` → map `backendNamespace → []RuleGroup` (the backend
+     also selects the namespace separator; see §2).
+   - `List()` all namespaces/groups for tenant (bulk endpoint only — sufficient for the
+     whole diff, and the read path proven on the live cluster. Loki's per-group GET does
+     work; an earlier claim that it returned a malformed 404 was a misdiagnosis of the
+     embedded-slash problem above).
    - For each desired namespace whose groups differ → `SetGroup` per group; delete
      groups in that namespace not desired.
    - Delete namespaces with the operator prefix not in desired set (prune).

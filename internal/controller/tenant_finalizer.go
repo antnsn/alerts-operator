@@ -3,12 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/antnsn/alerts-operator/api/v1alpha1"
 	"github.com/antnsn/alerts-operator/internal/backend"
+	"github.com/antnsn/alerts-operator/internal/compile"
 )
 
 // finalize removes everything this tenant owns in its backends: the Alertmanager config and every
@@ -23,7 +23,9 @@ import (
 // separate keys are in play, deliberately not the same one:
 //   - Rule namespaces use (tenantId, backend address, effective prefix) -- the exact key
 //     conflictingTenant checks for the steady-state prune in tenant_rules.go, since
-//     <prefix>/<k8s-namespace>/<name> is genuinely scoped by prefix.
+//     <prefix><sep><k8s-namespace><sep><name> is genuinely scoped by prefix. sep is "/" on Mimir
+//     and "_" on Loki (compile.BackendNamespace), so the delete sweep below is run per backend
+//     with that backend named explicitly -- never once with a separator assumed from context.
 //   - The Alertmanager document uses (tenantId, backend address) only, with no prefix at all:
 //     POST/GET/DELETE /api/v1/alerts is scoped solely by X-Scope-OrgID and the backend, so two
 //     Tenants with the same tenantId and address share one live document even when they use
@@ -40,8 +42,6 @@ import (
 // set of Tenants deleted together actually perform the cleanup, rather than every member deferring to
 // every other member.
 func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant) error {
-	prefix := tenant.Prefix() + "/"
-
 	if tenant.Spec.Mimir != nil {
 		mc, err := r.mimirClient(ctx, tenant)
 		if err != nil {
@@ -91,7 +91,7 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 			r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "FinalizeSkipped",
 				"mimir: Tenant %q shares tenantId %q, address %s, rulesNamespacePrefix %q; rule namespaces left untouched for it to reconcile",
 				owner, tenant.Spec.TenantID, backendAddress(tenant, v1alpha1.BackendMimir), tenant.Prefix())
-		} else if err := deleteOwnedNamespaces(ctx, mc, prefix); err != nil {
+		} else if err := deleteOwnedNamespaces(ctx, mc, v1alpha1.BackendMimir, tenant.Prefix()); err != nil {
 			return fmt.Errorf("mimir rules: %w", err)
 		}
 	}
@@ -109,7 +109,7 @@ func (r *TenantReconciler) finalize(ctx context.Context, tenant *v1alpha1.Tenant
 			r.Recorder.Eventf(tenant, corev1.EventTypeWarning, "FinalizeSkipped",
 				"loki: Tenant %q shares tenantId %q, address %s, rulesNamespacePrefix %q; rule namespaces left untouched for it to reconcile",
 				owner, tenant.Spec.TenantID, backendAddress(tenant, v1alpha1.BackendLoki), tenant.Prefix())
-		} else if err := deleteOwnedNamespaces(ctx, lc, prefix); err != nil {
+		} else if err := deleteOwnedNamespaces(ctx, lc, v1alpha1.BackendLoki, tenant.Prefix()); err != nil {
 			return fmt.Errorf("loki rules: %w", err)
 		}
 	}
@@ -209,17 +209,20 @@ func finalizeOwner(tenant *v1alpha1.Tenant, claimants []v1alpha1.Tenant) string 
 	return lowest
 }
 
-// deleteOwnedNamespaces deletes every rule namespace starting with prefix. prefix must include the
-// trailing "/" (as tenant.Prefix()+"/" does) so a segment-boundary match -- never a bare
-// strings.HasPrefix on the unslashed prefix -- keeps "alerts-operator/..." from matching a
-// differently-owned "alerts-operator-other/...".
-func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, prefix string) error {
+// deleteOwnedNamespaces deletes every rule namespace owned by prefix on backend be. Ownership is
+// compile.OwnsNamespace -- a segment-boundary match on prefix + that backend's separator, never a
+// bare strings.HasPrefix on the unslashed prefix -- which keeps "alerts-operator" from claiming a
+// differently-owned "alerts-operator-other/..." (Mimir) or "alerts-operator-other_..." (Loki).
+//
+// be is passed explicitly rather than inferred from store's concrete type: the separator must be
+// stated by the caller that knows which backend it is finalizing.
+func deleteOwnedNamespaces(ctx context.Context, store backend.RuleStore, be v1alpha1.Backend, prefix string) error {
 	actual, err := store.List(ctx)
 	if err != nil {
 		return err
 	}
 	for ns := range actual {
-		if strings.HasPrefix(ns, prefix) {
+		if compile.OwnsNamespace(be, prefix, ns) {
 			if err := store.DeleteNamespace(ctx, ns); err != nil {
 				return err
 			}

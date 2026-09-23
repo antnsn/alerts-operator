@@ -85,7 +85,9 @@ type AlertRuleGroupStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// BackendNamespace is the rule namespace used in the backend, <prefix>/<namespace>/<name>.
+	// BackendNamespace is the rule namespace used in the backend: <prefix>/<namespace>/<name> for
+	// backend mimir, <prefix>_<namespace>_<name> for backend loki (Loki's ruler rejects a namespace
+	// containing "/").
 	// +optional
 	BackendNamespace string `json:"backendNamespace,omitempty"`
 }

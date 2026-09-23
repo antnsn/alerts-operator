@@ -130,8 +130,10 @@ spec:
             description: AlertRuleGroupStatus defines the observed state of AlertRuleGroup.
             properties:
               backendNamespace:
-                description: BackendNamespace is the rule namespace used in the backend,
-                  <prefix>/<namespace>/<name>.
+                description: |-
+                  BackendNamespace is the rule namespace used in the backend: <prefix>/<namespace>/<name> for
+                  backend mimir, <prefix>_<namespace>_<name> for backend loki (Loki's ruler rejects a namespace
+                  containing "/").
                 type: string
               conditions:
                 items:

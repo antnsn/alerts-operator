@@ -11,6 +11,10 @@
 
 Run executed 2026-09-22 against commit `2ff8497`, image `ghcr.io/antnsn/alerts-operator:sha-2ff8497`.
 
+> **§4's Loki assertions are stale and were never re-run.** They were observed against the broken
+> `/`-joined Loki namespace scheme. The fix for that (`alerts-operator-b4o`) has landed but has
+> **not** been verified on a live cluster — see §8 for what still has to be proven.
+
 No kind. The acceptance run is against the real Mimir (`mimir-distributed-nginx.mimir:80`) and
 Loki (`loki-gateway.loki`), but under its own backend tenant `e2e` (Mimir/Loki multitenancy keeps
 its rules and Alertmanager config apart from production tenant `1`, and production tenant
@@ -183,7 +187,7 @@ e2e/pushover`; Tenant `AlertmanagerSynced=False/Invalid`; backend still lists `e
 `$M/api/v1/alerts` (stale document kept, not wiped) — exactly as the brief describes. Reverting the
 `ExternalSecret`'s key back to `PUSHOVER-TOKEN` brought everything back to `True` within 1s.
 
-## 4. Rules — PASSED for Mimir, BLOCKED for Loki (cluster-side finding, not a code bug)
+## 4. Rules — PASSED for Mimir, BLOCKED for Loki (namespace-scheme collision; fixed in §8, not yet re-run)
 
 **Finding in the runbook itself:** the brief's exact command,
 
@@ -204,7 +208,9 @@ With that fixed:
 - `udm` (Loki): `Accepted=True`, **`Synced=False/Invalid`**, message `loki: backend returned 404: 404 page not found`.
 
 Investigated this Loki failure by hand (bypassing the operator, hitting Loki directly, and hitting
-the gateway) rather than assuming it was our client's bug:
+the gateway) rather than assuming it was our client's bug. It turned out to be a collision between
+Loki's routing and *this operator's* namespace convention, and the convention is the side that got
+fixed — see §8:
 
 - The nginx gateway *does* proxy `/loki/api/v1/rules/` to `loki.loki.svc.cluster.local:3100` — not
   a gateway routing gap.
@@ -224,16 +230,20 @@ the gateway) rather than assuming it was our client's bug:
 - Corroborating evidence: production tenant `1`'s existing Loki rules use the single-segment
   namespace `loki-homelab` (no embedded `/`) — whoever set that up already worked around this same
   limitation.
-- This matches (and generalizes) the known gotcha in this repo's `CLAUDE.md` ("Loki 3.6.7 ruler:
-  per-group GET .../{ns}/{group} returns malformed 404 — use bulk GET only"): on this Loki
-  deployment, **every per-namespace/per-group ruler endpoint** — GET-single, POST-create, and (by
-  the same routing logic, though not separately verified) DELETE — is unreachable for any namespace
-  containing a literal `/`. Only the bulk `GET /loki/api/v1/rules` works. Since this operator's
-  namespace scheme (`rulesNamespacePrefix/namespace/name`) always embeds at least one `/`, **the
-  Loki backend cannot sync any AlertRuleGroup on this cluster's Loki as currently deployed.** This
-  is a real, reproducible finding about the target environment (or about the operator's namespace
-  convention colliding with it), not a flake — confirmed twice, with `curl` entirely independent of
-  the operator.
+- On this Loki deployment, **every per-namespace/per-group ruler endpoint** — GET-single,
+  POST-create and DELETE — is unreachable for any namespace containing a literal `/`. Since this
+  operator's namespace scheme was `rulesNamespacePrefix/namespace/name`, **the Loki backend could
+  not sync any AlertRuleGroup.** This is a real, reproducible finding about the target environment
+  colliding with the operator's namespace convention, not a flake — confirmed twice, with `curl`
+  entirely independent of the operator.
+- **Correction to what this repo previously believed.** `CLAUDE.md`, the design spec and the
+  `internal/backend/loki` comments all used to say that Loki 3.6.7's per-group
+  `GET /loki/api/v1/rules/{ns}/{group}` returns a malformed 404 and must never be called. That was a
+  **misdiagnosis of this same slash problem**. Re-tested against the live cluster on 2026-09-23 with
+  five slash-free separators (`-`, `_`, `.`, `:`, `__`): every one gives `POST=202`, **per-group
+  `GET=200`**, `DELETE=202`. The embedded `/` was always the sole cause. The operator still reads
+  only the bulk `GET /loki/api/v1/rules` — it is sufficient for the whole diff and already proven —
+  but for sufficiency, not because the per-group route is broken.
 - Given the size of the fix (either changing the Loki-side namespacing convention to avoid
   embedded slashes, or getting this Loki instance's ruler routing fixed/upgraded) and that this task
   is scoped to observing real behavior, no code change was made. The `udm` AlertRuleGroup was
@@ -251,6 +261,12 @@ the gateway) rather than assuming it was our client's bug:
   - Drift repair: `mcurl -X DELETE ... $M/prometheus/config/v1/rules/e2e%2Fe2e%2Fhomelab` → `202`;
     namespace confirmed gone immediately, then reappeared on its own within 40s (inside the 1m
     `resyncInterval`).
+
+### §4 Loki steps: NOT RE-RUN — pending live verification
+
+The Loki half of §4 above is still recorded as it was observed on 2026-09-22, against the broken
+namespace scheme. A fix has landed on `main` (`_` as the Loki namespace separator — see §8) but
+**nobody has re-run these steps against a live cluster**, so nothing here may be read as a pass.
 
 ## 5. Fire a real alert — PASSED (via a throwaway echo receiver, see deviations above)
 
@@ -346,7 +362,81 @@ unchanged:
 4. `kubectl delete secret <eso-owned>` alone does not reliably test `SecretNotFound` because ESO
    recreates it in ~1-2s — worked around by also breaking the `ExternalSecret`'s `remoteRef` (found
    this session).
-5. The Loki backend cannot sync any rule group on this cluster's Loki as currently deployed/
-   configured, because this operator's namespace scheme always embeds a literal `/` and this Loki
-   version's ruler HTTP router 404s on any per-namespace/per-group route once that `/` is present
-   (found this session; root-caused independently of the operator with direct `curl`).
+5. The Loki backend could not sync any rule group on this cluster's Loki, because the operator's
+   namespace scheme embedded a literal `/` and this Loki version's ruler HTTP router 404s on any
+   per-namespace route once that `/` is present (found this session; root-caused independently of
+   the operator with direct `curl`). A code fix has since landed (Loki rule namespaces are joined
+   with `_`), but **it has not been verified against a live cluster** — see §8.
+
+## 8. Loki namespace separator fix — PENDING LIVE VERIFICATION
+
+**Status: not verified against a live cluster.** The fix below is committed and covered by unit
+tests, but the cluster was unreachable when the change was made (home power outage; `kubectl get
+nodes` → `Unable to connect to the server: context deadline exceeded`), so **no step in this
+section has been executed against real Mimir/Loki.** Treat every Loki assertion in §4 as
+outstanding until this section is filled in with observed output.
+
+### What changed
+
+`alerts-operator-b4o`. A Loki rule namespace is now `<prefix>_<k8s-namespace>_<name>` instead of
+`<prefix>/<k8s-namespace>/<name>`. Mimir is untouched and keeps `/` — its ruler handles embedded
+slashes and its scheme was verified working in §4. `spec.rulesNamespacePrefix` now rejects `_`, so
+the separator stays unambiguous (Kubernetes namespace and object names cannot contain `_`).
+
+The old "Loki 3.6.7's per-group GET returns a malformed 404" claim was a **misdiagnosis** and has
+been removed from `CLAUDE.md`, the design spec, `docs/migration.md` and the `internal/backend/loki`
+comments. Per-group GET works (verified `200` against live Loki 3.6.7 on 2026-09-23, with five
+slash-free separators). The operator still reads only the bulk `GET /loki/api/v1/rules`, because
+one bulk read covers the whole diff — not because the per-group route is broken.
+
+### What must be proven once the cluster is back
+
+Run against the commit that carries the fix, deploying the `:sha-<short>` image the `dev-image`
+job builds for it (not `:dev`). Namespace `e2e`, backend tenant `e2e`, prefix `e2e`.
+
+1. `make deploy-dev` at the fix commit's `sha-` tag.
+2. Apply `docs/examples/alertrulegroup-loki.yaml` rewritten for the `e2e` namespace/tenant
+   (apply each example file separately — see deviation 3).
+3. `kubectl -n e2e get alertrulegroup udm -o yaml` → `Accepted=True`, **`Synced=True`**, and
+   `.status.backendNamespace` = `e2e_e2e_udm` (no `/`).
+4. `mcurl -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules | grep '^e2e_'` → lists `e2e_e2e_udm`.
+5. Drift repair: `mcurl -X DELETE -H 'X-Scope-OrgID: e2e' $L/loki/api/v1/rules/e2e_e2e_udm` →
+   expect `202` (not `404` — that 404 was the whole bug), then confirm the namespace reappears
+   within the `resyncInterval`.
+6. Teardown as in §7, then `make undeploy-dev` and `make purge-dev-crds`.
+
+**Production tenants `1` and `anonymous` must never be written or deleted.** Capture byte sizes of
+`/api/v1/alerts` and `/prometheus/config/v1/rules` for both, before and after, and compare against
+the §7 table (`1` = 43 / 111100, `anonymous` = 3097 / 10550). Stop and report if any differ.
+
+| Tenant | Endpoint | Before | After |
+|---|---|---|---|
+| `1` | `/api/v1/alerts` | _not captured_ | _not captured_ |
+| `1` | `/prometheus/config/v1/rules` | _not captured_ | _not captured_ |
+| `anonymous` | `/api/v1/alerts` | _not captured_ | _not captured_ |
+| `anonymous` | `/prometheus/config/v1/rules` | _not captured_ | _not captured_ |
+
+### What the unit tests do and do not prove
+
+Covered now, and not before:
+
+- `compile.BackendNamespace(loki, …)` and every key `compile.Rules(loki, …)` produces contains no
+  `/`; `status.backendNamespace` on a Loki `AlertRuleGroup` contains no `/`.
+- `backend/fake` models Loki's router: a slash-containing namespace 404s on POST/DELETE/GET
+  (one embedded slash instead collides with the `{ns}/{group}` route and yields 405), exactly as
+  the live ruler behaves, so this class of bug now fails in `go test`.
+- Prune and finalizer ownership match on a segment boundary per backend; reverting the guard to a
+  bare `strings.HasPrefix` fails those tests on both backends (verified by doing it).
+
+Not covered, and only a real cluster can settle it:
+
+- That real Loki 3.6.7 accepts `e2e_e2e_udm` through the gateway and stores it — the fake is a
+  model of Loki's routing built from `curl` observations, not Loki.
+- That LogQL in a real rule group validates server-side and the group actually evaluates.
+- That the operator reaches `Synced=True` end to end against the live gateway, with real
+  `X-Scope-OrgID` handling and auth.
+- That production tenants `1` and `anonymous` are untouched by a run of the new code.
+
+The original defect was invisible to twenty tasks' worth of unit tests precisely because the fake
+accepted what real Loki rejects. The new tests close that specific gap; they do not make a live run
+unnecessary.

@@ -47,6 +47,33 @@ func TestAlertRuleGroupAccepted(t *testing.T) {
 	waitCondition(t, missing, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
 }
 
+// TestAlertRuleGroupBackendNamespaceIsPerBackend: status.backendNamespace is what an operator reads
+// to find the group in the ruler, so it must be spelled with the separator that backend actually
+// uses -- "/" on Mimir, "_" on Loki. A Loki value containing "/" would name a namespace Loki's
+// router cannot address at all (alerts-operator-b4o).
+func TestAlertRuleGroupBackendNamespaceIsPerBackend(t *testing.T) {
+	newFakeTenant(t, "arg-tenant-ns", true, true) // both backends configured
+
+	mimirARG := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "arg-ns-m", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: "arg-tenant-ns", Backend: "mimir", Groups: ruleGroups("up == 0")}}
+	lokiARG := &observabilityv1alpha1.AlertRuleGroup{ObjectMeta: metav1.ObjectMeta{Name: "arg-ns-l", Namespace: "default"},
+		Spec: observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: "arg-tenant-ns", Backend: "loki", Groups: ruleGroups(`{job="x"} |= "e"`)}}
+	createAndCleanup(t, mimirARG)
+	createAndCleanup(t, lokiARG)
+	waitCondition(t, mimirARG, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+	waitCondition(t, lokiARG, observabilityv1alpha1.ConditionAccepted, metav1.ConditionTrue, observabilityv1alpha1.ReasonAccepted)
+
+	if got, want := mimirARG.Status.BackendNamespace, "alerts-operator/default/arg-ns-m"; got != want {
+		t.Fatalf("mimir backendNamespace = %q, want %q", got, want)
+	}
+	if got, want := lokiARG.Status.BackendNamespace, "alerts-operator_default_arg-ns-l"; got != want {
+		t.Fatalf("loki backendNamespace = %q, want %q", got, want)
+	}
+	if strings.Contains(lokiARG.Status.BackendNamespace, "/") {
+		t.Fatalf("a Loki backendNamespace must never contain %q: %q", "/", lokiARG.Status.BackendNamespace)
+	}
+}
+
 // TestAlertRuleGroupOversizedMessageTruncated guards against metav1.Condition's
 // Message MaxLength=32768 (enforced by the generated CRD schema): rule.expr has no MaxLength
 // of its own, and promql's parser echoes the whole offending input back into its error, so an

@@ -201,13 +201,14 @@ kubectl get alertrulegroups -n monitoring
 M=http://mimir-distributed-nginx.mimir:80
 kubectl -n mimir run curl --rm -it --image=curlimages/curl --restart=Never -- sh -c "
   curl -s -H 'X-Scope-OrgID: 1' $M/prometheus/config/v1/rules | grep '^alerts-operator/'; echo ---;
-  curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator/'"
+  curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep '^alerts-operator_'"
 ```
-Expected: `Accepted=True Synced=True` for all; namespaces `alerts-operator/monitoring/homelab`, `alerts-operator/monitoring/loki-homelab`, `alerts-operator/monitoring/loki-udm`.
+Expected: `Accepted=True Synced=True` for all; Mimir namespace `alerts-operator/monitoring/homelab`, Loki namespaces `alerts-operator_monitoring_loki-homelab`, `alerts-operator_monitoring_loki-udm` (Loki joins on `_`; its ruler rejects a namespace containing `/`).
 
 (Both `GET` calls above are the bulk `/prometheus/config/v1/rules` and `/loki/api/v1/rules` list
-endpoints. Never `GET` a single Loki rule namespace by path — on Loki 3.6.7 that per-group `GET`
-returns a malformed 404, which is why the operator itself only ever lists in bulk.)
+endpoints — one read covers the whole diff, which is why the operator itself only ever lists in
+bulk. Loki's per-group `GET /loki/api/v1/rules/{ns}/{group}` does work on 3.6.7; what its ruler
+cannot address is a namespace containing `/`, which is why Loki rule namespaces are joined with `_`.)
 
 At this point Mimir has the rules twice (Alloy `homelab/*` and operator `alerts-operator/*`). Alerts fire twice until step 5. Do step 5 the same day.
 
@@ -228,7 +229,7 @@ in step 3 is not that proof. This step deletes tenant `anonymous`'s Alertmanager
 what has actually been delivering alerts until now; the only way back after this step is restoring
 your "Before you begin" backup by hand.
 
-Alloy's prefix and mimir-sync's namespaces are outside `alerts-operator/`, so the operator never touches them.
+Alloy's prefix and mimir-sync's namespaces are outside `alerts-operator/` (Mimir) and `alerts-operator_` (Loki), so the operator never touches them.
 
 This step is irreversible for anything you haven't already backed up. The last line below,
 `DELETE /api/v1/alerts` for tenant `anonymous`, wipes that tenant's **entire** Alertmanager
@@ -304,12 +305,12 @@ kubectl -n mimir run curl --rm -it --image=curlimages/curl --restart=Never -- sh
   echo 'mimir tenant anonymous (expect no rule groups left):'
   curl -s -i -H 'X-Scope-OrgID: anonymous' $M/prometheus/config/v1/rules
   echo ---
-  echo 'loki tenant 1 (expect only alerts-operator/*):'
+  echo 'loki tenant 1 (expect only alerts-operator_*):'
   curl -s -H 'X-Scope-OrgID: 1' http://loki-gateway.loki/loki/api/v1/rules | grep -E '^[A-Za-z]'"
 ```
 
 Expected: the tenant-`1` mimir output lists only namespaces starting with `alerts-operator/`; the
-loki output lists only namespaces starting with `alerts-operator/`; tenant `anonymous` shows no
+loki output lists only namespaces starting with `alerts-operator_`; tenant `anonymous` shows no
 rule-group content either way, but don't expect a `404` for it specifically — on this cluster's
 Mimir, a tenant with zero rule groups returns `200` with an empty `{}` body (verified against a
 synthetic empty tenant), not `404` — `404` is what Loki does for the same situation, a different

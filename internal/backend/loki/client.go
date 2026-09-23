@@ -1,7 +1,16 @@
 // Package loki talks to the Grafana Loki ruler API.
 //
-// Only the bulk GET /loki/api/v1/rules is used for reads: on Loki 3.6.7 the
-// per-group GET returns a malformed 404.
+// Only the bulk GET /loki/api/v1/rules is used for reads. This is a sufficiency
+// choice, not a workaround: one bulk read gives the reconciler everything it
+// diffs, and it is the read path proven against the live cluster. The per-group
+// GET /loki/api/v1/rules/{ns}/{group} works fine (verified 200 on Loki 3.6.7);
+// an earlier belief that it returned a malformed 404 was a misdiagnosis of
+// alerts-operator-b4o.
+//
+// What Loki's ruler really rejects is an embedded "/" in the namespace: its
+// router matches on the decoded path, so %2F becomes a path-segment boundary
+// and every per-namespace route 404s. Rule namespaces for Loki are therefore
+// joined with "_" -- see compile.BackendNamespace.
 package loki
 
 import (

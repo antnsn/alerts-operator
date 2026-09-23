@@ -69,10 +69,17 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 
 	waitCondition(t, tn, observabilityv1alpha1.ConditionReady, metav1.ConditionTrue, "")
 	rules, lokiRules := srv.Rules("1"), srv.LokiRules("1")
-	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(lokiRules["alerts-operator/default/sync-l"]) != 1 || len(rules["other/x"]) != 1 {
+	// The Loki namespace is joined with "_", not "/": Loki's ruler 404s on any namespace containing
+	// a slash, so this spelling is the whole point of the fix (alerts-operator-b4o). Mimir keeps "/".
+	if len(rules["alerts-operator/default/sync-m"]) != 2 || len(lokiRules["alerts-operator_default_sync-l"]) != 1 || len(rules["other/x"]) != 1 {
 		t.Fatalf("rules in backend: mimir=%+v loki=%+v", rules, lokiRules)
 	}
-	if _, leaked := rules["alerts-operator/default/sync-l"]; leaked {
+	for ns := range lokiRules {
+		if strings.Contains(ns, "/") {
+			t.Fatalf("a Loki rule namespace written by the operator must never contain %q: %q", "/", ns)
+		}
+	}
+	if _, leaked := rules["alerts-operator_default_sync-l"]; leaked {
 		t.Fatal("loki group must not be written to mimir")
 	}
 	am := srv.Alertmanager("1")
@@ -123,7 +130,7 @@ func TestTenantSyncsRulesAndAlertmanager(t *testing.T) {
 	if err := testClient.Delete(testCtx, lokiG); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { _, ok := srv.LokiRules("1")["alerts-operator/default/sync-l"]; return !ok })
+	waitFor(t, func() bool { _, ok := srv.LokiRules("1")["alerts-operator_default_sync-l"]; return !ok })
 	if _, ok := srv.Rules("1")["other/x"]; !ok {
 		t.Fatal("foreign namespace was pruned")
 	}
@@ -217,6 +224,51 @@ func TestTenantKeepsStaleGenerationNamespace(t *testing.T) {
 	rs := s.Rules("1")["alerts-operator/default/stale-m"]
 	if len(rs) != 1 || rs[0].Rules[0].Expr != "up == 1" {
 		t.Fatalf("child re-validating should let the Tenant reconciler push the new content: %+v", rs)
+	}
+}
+
+// TestTenantKeepsBothBackendNamespacesWhileBackendSwitchIsStale covers the Codex P1 on the
+// Loki-separator change (alerts-operator-b4o review round 1). Editing an AlertRuleGroup's
+// spec.backend bumps its Generation, and spec.backend already reads as the NEW backend while
+// Accepted still describes the old one. Keying the keep entry only by spec.backend would therefore
+// protect the namespace the group is moving *to* and leave the one it currently occupies
+// unprotected: the old backend's prune sees a namespace under its prefix that nothing desires and
+// deletes live, firing rules before the edit has even been validated.
+//
+// Before the separator change this could not happen -- both backends computed the same namespace
+// string, so one keep entry covered both. The fix restores that property explicitly by keeping the
+// namespace on every backend during the stale window.
+func TestTenantKeepsBothBackendNamespacesWhileBackendSwitchIsStale(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+	const oldGen, newGen = int64(1), int64(2)
+	// What the group currently occupies, written while it was still backend: mimir.
+	s.SetRules("1", "alerts-operator/default/switcher", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "A", Expr: "up == 0"}}}})
+
+	tn := &observabilityv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "switch-tenant", Finalizers: []string{tenantFinalizer}},
+		Spec: observabilityv1alpha1.TenantSpec{TenantID: "1",
+			Mimir: &observabilityv1alpha1.BackendSpec{Address: s.URL},
+			Loki:  &observabilityv1alpha1.BackendSpec{Address: s.URL}},
+	}
+	// spec.backend already says loki; Accepted is still the pre-edit observation at oldGen.
+	switcher := &observabilityv1alpha1.AlertRuleGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "switcher", Namespace: "default", Generation: newGen},
+		Spec:       observabilityv1alpha1.AlertRuleGroupSpec{TenantRef: tn.Name, Backend: observabilityv1alpha1.BackendLoki, Groups: ruleGroups(`{job="x"} |= "e"`)},
+		Status:     observabilityv1alpha1.AlertRuleGroupStatus{Conditions: acceptedAt(oldGen)},
+	}
+
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, tn, switcher), Recorder: record.NewFakeRecorder(20)}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tn.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s.Rules("1")["alerts-operator/default/switcher"]) != 1 {
+		t.Fatalf("the namespace the group still occupies must survive the unvalidated window: %+v mimir=%+v requests=%v",
+			s.Rules("1"), s.Rules("1"), s.Requests())
+	}
+	if n := countPrefix(s.Requests(), "DELETE"); n != 0 {
+		t.Fatalf("no DELETE expected while a backend switch is unvalidated: %v", s.Requests())
 	}
 }
 
@@ -492,7 +544,7 @@ func seedGroup(alert string) []backend.RuleGroup {
 }
 
 // TestTenantDoesNotPruneWhenAnotherTenantSharesOwnership covers P1-1 of the Task 19 review. A
-// backend rule namespace is <prefix>/<k8s-namespace>/<name> and carries no Tenant identity, and
+// backend rule namespace is <prefix><sep><k8s-namespace><sep><name> and carries no Tenant identity, and
 // store.List is scoped only by X-Scope-OrgID, so two Tenant CRs sharing tenantId + backend address
 // + effective prefix each see the other's namespaces as "under my prefix but not desired" and
 // delete them — alternating forever, with Ready=True on both. The review reproduced exactly this:
@@ -566,13 +618,73 @@ func TestTenantPrunesWithoutOwnershipConflict(t *testing.T) {
 	}
 }
 
+// TestTenantPruneMatchesOwnershipOnSegmentBoundary is the guard that has to survive the Loki
+// separator change: the prune claims a namespace only when it starts with prefix + *that backend's*
+// separator. Deleting the guard -- reverting to a bare strings.HasPrefix(ns, tenant.Prefix()) --
+// makes this test delete "alerts-operator-other/default/x" and "alerts-operator-other_default_x",
+// which are somebody else's live rules.
+//
+// It covers both backends deliberately: before the fix the separator was "/" everywhere and only
+// the Mimir spelling was ever exercised, so a Loki-side boundary bug would have gone unnoticed. The
+// cross-shaped cases matter too: a Mimir-shaped "alerts-operator/..." must not be claimed by the
+// *Loki* prune (nothing this operator writes to Loki looks like that), and vice versa.
+func TestTenantPruneMatchesOwnershipOnSegmentBoundary(t *testing.T) {
+	s := fakebackend.New()
+	t.Cleanup(s.Close)
+
+	// Genuinely ours on each backend, and no longer desired -> must be pruned.
+	s.SetRules("1", "alerts-operator/default/gone-m", seedGroup("M"))
+	s.SetLokiRules("1", "alerts-operator_default_gone-l", seedGroup("L"))
+	// Lookalike prefixes: the same leading characters, but the next character is not the separator.
+	s.SetRules("1", "alerts-operator-other/default/x", seedGroup("MO"))
+	s.SetLokiRules("1", "alerts-operator-other_default_x", seedGroup("LO"))
+	// Wrong-backend shapes: each backend must only claim its own separator.
+	s.SetRules("1", "alerts-operator_default_mimir-shaped-loki-name", seedGroup("MX"))
+	s.SetLokiRules("1", "alerts-operator/default/loki-shaped-mimir-name", seedGroup("LX"))
+
+	tn := mimirTenantAt("boundary-tenant", s.URL, "")
+	tn.Spec.Loki = &observabilityv1alpha1.BackendSpec{Address: s.URL}
+	r := &TenantReconciler{Client: newChildrenFakeClient(t, tn), Recorder: record.NewFakeRecorder(20)}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tn.Name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	mimirNow, lokiNow := s.Rules("1"), s.LokiRules("1")
+	for _, gone := range []struct {
+		in   map[string][]backend.RuleGroup
+		ns   string
+		what string
+	}{
+		{mimirNow, "alerts-operator/default/gone-m", "mimir"},
+		{lokiNow, "alerts-operator_default_gone-l", "loki"},
+	} {
+		if _, ok := gone.in[gone.ns]; ok {
+			t.Fatalf("%s: an undesired namespace under our own prefix must still be pruned: %q survived", gone.what, gone.ns)
+		}
+	}
+	for _, kept := range []struct {
+		in  map[string][]backend.RuleGroup
+		ns  string
+		why string
+	}{
+		{mimirNow, "alerts-operator-other/default/x", "a longer prefix is a different owner"},
+		{lokiNow, "alerts-operator-other_default_x", "a longer prefix is a different owner"},
+		{mimirNow, "alerts-operator_default_mimir-shaped-loki-name", "mimir joins on \"/\", so an underscore name is not ours"},
+		{lokiNow, "alerts-operator/default/loki-shaped-mimir-name", "loki joins on \"_\", so a slash name is not ours"},
+	} {
+		if _, ok := kept.in[kept.ns]; !ok {
+			t.Fatalf("%q must never be pruned (%s); requests: %v", kept.ns, kept.why, s.Requests())
+		}
+	}
+}
+
 // TestTenantOwnershipConflictIsPerBackend: Mimir and Loki are separate targets. Two Tenants sharing
 // a Mimir must not stop either of them pruning its own Loki, which nothing else claims.
 func TestTenantOwnershipConflictIsPerBackend(t *testing.T) {
 	s := fakebackend.New()
 	t.Cleanup(s.Close)
 	s.SetRules("1", "alerts-operator/default/stale-mimir", seedGroup("M"))
-	s.SetLokiRules("1", "alerts-operator/default/stale-loki", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "L", Expr: `{job="x"} |= "e"`}}}})
+	s.SetLokiRules("1", "alerts-operator_default_stale-loki", []backend.RuleGroup{{Name: "g", Rules: []backend.Rule{{Alert: "L", Expr: `{job="x"} |= "e"`}}}})
 
 	both := mimirTenantAt("both-backends", s.URL, "")
 	both.Spec.Loki = &observabilityv1alpha1.BackendSpec{Address: s.URL}
@@ -586,7 +698,7 @@ func TestTenantOwnershipConflictIsPerBackend(t *testing.T) {
 	if _, ok := s.Rules("1")["alerts-operator/default/stale-mimir"]; !ok {
 		t.Fatalf("the contested Mimir namespace must survive: %+v", s.Rules("1"))
 	}
-	if _, ok := s.LokiRules("1")["alerts-operator/default/stale-loki"]; ok {
+	if _, ok := s.LokiRules("1")["alerts-operator_default_stale-loki"]; ok {
 		t.Fatalf("a Mimir collision must not block the uncontested Loki prune: %+v", s.LokiRules("1"))
 	}
 	var got observabilityv1alpha1.Tenant
