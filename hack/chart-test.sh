@@ -37,7 +37,11 @@ assert_has '--metrics-secure=false' "$OUT/default.yaml"
 # Secret/ConfigMap informers are unrestricted by default; the narrowing flag is only rendered when
 # cache.labelSelector is set (see values.yaml for what setting it obliges a user to do).
 assert_not '\-\-watch-label-selector' "$OUT/default.yaml"
-assert_has 'image: ghcr.io/antnsn/alerts-operator:0.1.0' "$OUT/default.yaml"
+# The default image tag is the chart's appVersion; read it from Chart.yaml so a
+# release bump can't leave this assertion pinned to a stale tag.
+appver=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART/Chart.yaml")
+[ -n "$appver" ] || { echo "chart-test: could not read appVersion from $CHART/Chart.yaml" >&2; exit 1; }
+assert_has "image: ghcr.io/antnsn/alerts-operator:$appver" "$OUT/default.yaml"
 assert_not '^kind: ServiceMonitor$' "$OUT/default.yaml"
 
 # No admission webhooks anywhere in this project (design constraint) - kubebuilder
